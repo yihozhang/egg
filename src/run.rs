@@ -411,12 +411,6 @@ where
                     .scheduler
                     .search_rewrite(i, &self.egraph, rule);
                 let num_of_rewrites = ms.iter().map(|m| m.substs.len()).sum::<usize>();
-                println!(
-                    "{:20} {:10} {:?}",
-                    rule.name(),
-                    num_of_rewrites,
-                    start.elapsed(),
-                );
                 matches.push(ms);
                 self.check_limits()
             })

@@ -65,6 +65,137 @@ pub struct Pattern<L: Language> {
     query: Option<Query<L>>,
 }
 
+#[allow(missing_docs)]
+#[derive(Debug, Clone)]
+pub struct MultiPattern<L: Language> {
+    vars: Vec<Var>,
+    query: Query<L>,
+    subpats: Vec<Pattern<L>>,
+}
+
+#[allow(missing_docs)]
+impl<L: Language> MultiPattern<L> {
+    pub fn from_strs(subpats: &[&str]) -> MultiPattern<L> {
+        use std::str::FromStr;
+        let subpats: Vec<Pattern<L>> = subpats
+            .iter()
+            // unwrap for now
+            .map(|s| Pattern::<L>::from_str(s).unwrap())
+            .collect();
+        MultiPattern::new(subpats)
+    }
+
+    pub fn new(subpats: Vec<Pattern<L>>) -> MultiPattern<L> {
+        let mut vars: Vec<Var> = subpats.iter().map(|pat| pat.vars()).flatten().collect();
+        vars.sort();
+        vars.dedup();
+        let mut id_cnt = 0;
+        let mut subqs: Vec<Query<L>> = subpats
+            .iter()
+            .map(|pat| {
+                pat.query
+                    .clone()
+                    .expect("pattern should be compiled to CQs")
+            })
+            .collect();
+        for q in subqs.iter_mut() {
+            let mut id_remapping: HashMap<Id, Id> = Default::default();
+            for atom in q.atoms.iter_mut() {
+                for term in atom.terms.iter_mut() {
+                    *term = match term {
+                        qry::Term(VarOrId::Var(_)) => term.clone(),
+                        qry::Term(VarOrId::Id(id)) => {
+                            let id = *id_remapping.entry(*id).or_insert_with(|| {
+                                id_cnt += 1;
+                                Id(id_cnt)
+                            });
+                            qry::Term(VarOrId::Id(id))
+                        }
+                    }
+                }
+            }
+        }
+        let q = subqs
+            .into_iter()
+            .map(|subq| subq.atoms)
+            .flatten()
+            .collect();
+        let query = Query::<L>::new(q);
+        println!("{:?}", query);
+        MultiPattern { query, vars, subpats }
+    }
+}
+
+impl<L: Language, A: Analysis<L>> Searcher<L, A> for MultiPattern<L> {
+    fn search(&self, egraph: &EGraph<L, A>) -> Vec<SearchMatches> {
+        self.search_with_limit(egraph, usize::MAX)
+    }
+    fn search_with_limit(&self, egraph: &EGraph<L, A>, mut limit: usize) -> Vec<SearchMatches> {
+        if limit == 0 {
+            return vec![];
+        }
+        let q = &self.query;
+        let var_map = q.vars(&egraph.db);
+
+        let vars: Vec<(Var, usize)> = var_map
+            .iter()
+            .enumerate()
+            .filter_map(|(i, vori)| match vori {
+                VarOrId::Var(v) => Some((*v, i)),
+                VarOrId::Id(_) => None,
+            })
+            .collect();
+
+        let mut map: HashMap<Id, Vec<Subst>> = Default::default();
+        use std::borrow::BorrowMut;
+        q.join(
+            &var_map,
+            &egraph.db,
+            egraph.eval_ctx.try_lock().unwrap().borrow_mut(),
+            |tuple| {
+                let vec = vars.iter().map(|(v, i)| (*v, tuple[*i])).collect();
+                let subst = Subst { vec };
+                // NOTE: currently we don't support finding the root of matched patterns
+                map.entry(Id(0)).or_default().push(subst);
+                limit -= 1;
+                if limit == 0 {
+                    return Err(());
+                }
+                Ok(())
+            },
+        )
+        .unwrap_or_default();
+
+        return map
+            .into_iter()
+            .map(|(eclass, substs)| SearchMatches { eclass, substs })
+            .collect();
+    }
+
+    fn search_eclass(&self, egraph: &EGraph<L, A>, eclass: Id) -> Option<SearchMatches> {
+        self.search_eclass_with_limit(egraph, eclass, usize::MAX)
+    }
+
+    fn search_eclass_with_limit(
+        &self,
+        egraph: &EGraph<L, A>,
+        eclass: Id,
+        limit: usize,
+    ) -> Option<SearchMatches> {
+        // TODO: could be further optimized
+        // NOTE: currently, this is not usable for multi-patterns
+        // (e.g., which eclass to look up???)
+        let id = egraph.find(eclass);
+        self.search_with_limit(egraph, limit)
+            .into_iter()
+            .find(|m| m.eclass == id)
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        self.vars.clone()
+    }
+}
+
 impl<L: Language> PartialEq for Pattern<L> {
     fn eq(&self, other: &Self) -> bool {
         self.ast == other.ast
