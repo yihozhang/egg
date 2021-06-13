@@ -146,6 +146,10 @@ impl<L: Language, A: Analysis<L>> Searcher<L, A> for MultiPattern<L> {
             })
             .collect();
 
+        let root = self.subpats[0].ast.as_ref().len() - 1;
+        let root_expr = VarOrId::Id(root.into());
+        let root_index = var_map.iter().position(|e| e == &root_expr).unwrap();
+
         let mut map: HashMap<Id, Vec<Subst>> = Default::default();
         use std::borrow::BorrowMut;
         q.join(
@@ -155,8 +159,8 @@ impl<L: Language, A: Analysis<L>> Searcher<L, A> for MultiPattern<L> {
             |tuple| {
                 let vec = vars.iter().map(|(v, i)| (*v, tuple[*i])).collect();
                 let subst = Subst { vec };
-                // NOTE: currently we don't support finding the root of matched patterns
-                map.entry(Id(0)).or_default().push(subst);
+                let root = egraph.find(tuple[root_index]);
+                map.entry(root).or_default().push(subst);
                 limit -= 1;
                 if limit == 0 {
                     return Err(());
