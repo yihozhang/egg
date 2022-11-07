@@ -833,31 +833,31 @@ where
         if banned.is_empty() {
             true
         } else {
-            let min_ban = banned
-                .iter()
-                .map(|(_, s)| s.banned_until)
-                .min()
-                .expect("banned cannot be empty here");
+            // let min_ban = banned
+            //     .iter()
+            //     .map(|(_, s)| s.banned_until)
+            //     .min()
+            //     .expect("banned cannot be empty here");
 
-            assert!(min_ban >= iteration);
-            let delta = min_ban - iteration;
+            // assert!(min_ban >= iteration);
+            // let delta = min_ban - iteration;
 
-            let mut unbanned = vec![];
-            for (name, s) in &mut banned {
-                s.banned_until -= delta;
-                if s.banned_until == iteration {
-                    unbanned.push(name.as_str());
-                }
-            }
+            // let mut unbanned = vec![];
+            // for (name, s) in &mut banned {
+            //     s.banned_until -= delta;
+            //     if s.banned_until == iteration {
+            //         unbanned.push(name.as_str());
+            //     }
+            // }
 
-            assert!(!unbanned.is_empty());
-            info!(
-                "Banned {}/{}, fast-forwarded by {} to unban {}",
-                banned.len(),
-                n_stats,
-                delta,
-                unbanned.join(", "),
-            );
+            // assert!(!unbanned.is_empty());
+            // info!(
+            //     "Banned {}/{}, fast-forwarded by {} to unban {}",
+            //     banned.len(),
+            //     n_stats,
+            //     delta,
+            //     unbanned.join(", "),
+            // );
 
             false
         }
