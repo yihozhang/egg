@@ -50,6 +50,7 @@ mod multipattern;
 mod pattern;
 mod rewrite;
 mod run;
+pub mod stochastic;
 mod subst;
 mod unionfind;
 mod util;

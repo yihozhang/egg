@@ -430,6 +430,118 @@ pub(crate) fn apply_pat<L: Language, A: Analysis<L>>(
     *ids.last().unwrap()
 }
 
+// ─── StoSearcher / StoApplier for Pattern ────────────────────────────────────
+
+use crate::stochastic::{StoAnalysis, StoApplier, StoSearcher, StoSearchMatch, State};
+
+/// Return `true` if the subterms rooted at `id1` and `id2` in `expr` are
+/// structurally identical (same operators, same tree shape, same leaves).
+///
+/// Used for non-linear pattern variables: once `?x` is bound to a position,
+/// every later occurrence must root an identical subterm.
+fn structurally_equal<L: Language>(expr: &RecExpr<L>, id1: Id, id2: Id) -> bool {
+    if id1 == id2 {
+        return true; // same position ⟹ identical by construction
+    }
+    let n1 = &expr[id1];
+    let n2 = &expr[id2];
+    n1.matches(n2)
+        && n1
+            .children()
+            .iter()
+            .zip(n2.children().iter())
+            .all(|(&c1, &c2)| structurally_equal(expr, c1, c2))
+}
+
+/// Attempt to match the pattern node `pat[pat_id]` against `expr[expr_id]`,
+/// recording variable bindings into `subst`.
+///
+/// Returns `false` (and leaves `subst` in an indeterminate state) on mismatch.
+fn match_pattern<L: Language>(
+    pat: &PatternAst<L>,
+    pat_id: Id,
+    expr: &RecExpr<L>,
+    expr_id: Id,
+    subst: &mut Subst,
+) -> bool {
+    match &pat[pat_id] {
+        ENodeOrVar::Var(v) => match subst.get(*v) {
+            // Already bound: the new position must root a structurally equal subterm.
+            Some(&bound) => structurally_equal(expr, bound, expr_id),
+            // First occurrence: bind the variable to this position.
+            None => {
+                subst.insert(*v, expr_id);
+                true
+            }
+        },
+        ENodeOrVar::ENode(pat_node) => {
+            let expr_node = &expr[expr_id];
+            // Operator and arity must match; then recurse into children.
+            pat_node.matches(expr_node)
+                && pat_node
+                    .children()
+                    .iter()
+                    .zip(expr_node.children().iter())
+                    .all(|(&pc, &ec)| match_pattern(pat, pc, expr, ec, subst))
+        }
+    }
+}
+
+/// Instantiate the RHS `pat` into `state` using variable bindings from `subst`.
+///
+/// Pattern variables are replaced by the positions they are bound to;
+/// concrete e-nodes are appended to `state` via [`State::add`].
+/// Returns the [`Id`] of the newly-built root node.
+fn sto_apply_pat<L: Language, A: StoAnalysis<L>>(
+    pat: &PatternAst<L>,
+    state: &mut State<L, A>,
+    subst: &Subst,
+) -> Id {
+    // `ids[i]` will hold the State position corresponding to `pat[i]`.
+    let mut ids = vec![Id::from(0usize); pat.len()];
+    for (i, node) in pat.iter().enumerate() {
+        ids[i] = match node {
+            ENodeOrVar::Var(v) => subst[*v],
+            ENodeOrVar::ENode(e) => {
+                // Remap the pattern's child indices to the State positions we
+                // already resolved in previous iterations.
+                let n = e.clone().map_children(|child| ids[usize::from(child)]);
+                state.add(n)
+            }
+        };
+    }
+    *ids.last().unwrap()
+}
+
+impl<L: Language, A: StoAnalysis<L>> StoSearcher<L, A> for Pattern<L> {
+    fn search_pos(&self, state: &State<L, A>, pos: Id) -> Option<StoSearchMatch> {
+        let mut subst = Subst::default();
+        if match_pattern(&self.ast, self.ast.root(), &state.rec_expr, pos, &mut subst) {
+            Some(StoSearchMatch { pos, substs: subst })
+        } else {
+            None
+        }
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        Pattern::vars(self)
+    }
+}
+
+impl<L: Language, A: StoAnalysis<L>> StoApplier<L, A> for Pattern<L> {
+    /// Build the RHS pattern into `state` and return the root of the new subterm.
+    ///
+    /// `pos` (the matched position) is unused: the substitution already
+    /// captures everything needed to instantiate the RHS.
+    fn apply_one(&self, state: &mut State<L, A>, _pos: Id, subst: &Subst) -> Option<Id> {
+        Some(sto_apply_pat(&self.ast, state, subst))
+    }
+
+    fn vars(&self) -> Vec<Var> {
+        Pattern::vars(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
