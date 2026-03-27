@@ -1,0 +1,99 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Explanations"><title>egg::tutorials::_03_explanations - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-77263533.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="egg" data-themes="" data-resource-suffix="" data-rustdoc-version="1.94.1 (e408947bf 2026-03-25)" data-channel="1.94.1" data-search-js="search-9e2438ea.js" data-stringdex-js="stringdex-b897f86f.js" data-settings-js="settings-c38705f0.js" ><script src="../../../static.files/storage-e2aeef58.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-7bab91a1.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-ffcac47a.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module _03_explanations</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../egg/index.html">egg</a><span class="version">0.11.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module _03_<wbr>explanations</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#explanations" title="Explanations">Explanations</a></li><li><a href="#explanation-trees" title="Explanation Trees">Explanation Trees</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In egg::<wbr>tutorials</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">egg</a>::<wbr><a href="../index.html">tutorials</a></div><h1>Module <span>_03_<wbr>explanations</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../../src/egg/tutorials/_03_explanations.rs.html#2-133">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><h2 id="explanations"><a class="doc-anchor" href="#explanations">§</a>Explanations</h2>
+<p>It’s often useful to know exactly why two terms are equivalent in
+the egraph.
+For example, if you are trying to debug incorrect rules,
+it would be useful to have a trace of rewrites showing how an example
+given bad equivalence was found.
+<code>egg</code> uses an algorithm adapted from
+<a href="https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.76.1716&amp;rep=rep1&amp;type=pdf">Proof-Producing Congruence Closure</a>
+in order to generate such <a href="../../struct.Explanation.html" title="struct egg::Explanation"><code>Explanation</code></a>s between two given terms.</p>
+<p>Consider this program, which prints a <a href="../../type.FlatExplanation.html" title="type egg::FlatExplanation"><code>FlatExplanation</code></a> showing how
+<code>(/ (* (/ 2 3) (/ 3 2)) 1)</code> can be simplified to <code>1</code>:</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>egg::{<span class="kw-2">*</span>, rewrite <span class="kw">as </span>rw};
+<span class="kw">let </span>rules: <span class="kw-2">&amp;</span>[Rewrite&lt;SymbolLang, ()&gt;] = <span class="kw-2">&amp;</span>[
+    <span class="macro">rw!</span>(<span class="string">"div-one"</span>; <span class="string">"?x" </span>=&gt; <span class="string">"(/ ?x 1)"</span>),
+    <span class="macro">rw!</span>(<span class="string">"unsafe-invert-division"</span>; <span class="string">"(/ ?a ?b)" </span>=&gt; <span class="string">"(/ 1 (/ ?b ?a))"</span>),
+    <span class="macro">rw!</span>(<span class="string">"simplify-frac"</span>; <span class="string">"(/ ?a (/ ?b ?c))" </span>=&gt; <span class="string">"(/ (* ?a ?c) (* (/ ?b ?c) ?c))"</span>),
+    <span class="macro">rw!</span>(<span class="string">"cancel-denominator"</span>; <span class="string">"(* (/ ?a ?b) ?b)" </span>=&gt; <span class="string">"?a"</span>),
+    <span class="macro">rw!</span>(<span class="string">"times-zero"</span>; <span class="string">"(* ?a 0)" </span>=&gt; <span class="string">"0"</span>),
+];
+
+<span class="kw">let </span>start = <span class="string">"(/ (* (/ 2 3) (/ 3 2)) 1)"</span>.parse().unwrap();
+<span class="kw">let </span>end = <span class="string">"1"</span>.parse().unwrap();
+<span class="kw">let </span><span class="kw-2">mut </span>runner = Runner::default().with_explanations_enabled().with_expr(<span class="kw-2">&amp;</span>start).run(rules);
+
+<span class="macro">println!</span>(<span class="string">"{}"</span>, runner.explain_equivalence(<span class="kw-2">&amp;</span>start, <span class="kw-2">&amp;</span>end).get_flat_string());</code></pre></div>
+<p>The output of the program is a series of s-expressions annotated
+with the rewrite being performed:</p>
+<div class="example-wrap"><pre class="language-text"><code>(/ (* (/ 2 3) (/ 3 2)) 1)
+(Rewrite&lt;= div-one (* (/ 2 3) (/ 3 2)))
+(* (Rewrite=&gt; unsafe-invert-division (/ 1 (/ 3 2))) (/ 3 2))
+(Rewrite=&gt; cancel-denominator 1)</code></pre></div>
+<p>At each step, the part of the term being rewritten is annotated
+with the rule being applied.
+Each term besides the first term has exactly one rewrite annotation.
+<code>Rewrite=&gt;</code> indicates that the previous term is rewritten to the current term
+and <code>Rewrite&lt;=</code> indicates that the current term is rewritten to the previous term.</p>
+<p>It turns out that these rules can easily lead to undesirable results in the egraph.
+For example, with just <code>0</code> as the starting term, the egraph finds that <code>0</code> is equivalent
+to <code>1</code> within a few iterations.
+Here’s the flattened explanation that <code>egg</code> generates:</p>
+<div class="example-wrap"><pre class="language-text"><code>0
+(Rewrite&lt;= times-zero (* (/ 1 0) 0))
+(Rewrite=&gt; cancel-denominator 1)</code></pre></div>
+<p>This tells you how the egraph got from <code>0</code> to <code>1</code>, but it’s not clear why.
+In fact, normally the rules <code>times-zero</code> and <code>cancel-denominator</code> are perfectly
+reasonable.
+However, in the presence of a division by zero, they lead to arbitrary unions in the egraph.
+So the true problem is the presense of the term <code>(/ 1 0)</code>.
+For these kinds of questions, <code>egg</code> provides the <code>explain_existance</code> function which can be used to get an explanation
+of why a term exists in the egraph in the first place.</p>
+<h2 id="explanation-trees"><a class="doc-anchor" href="#explanation-trees">§</a>Explanation Trees</h2>
+<p>So far we have looked at the <a href="../../type.FlatExplanation.html" title="type egg::FlatExplanation"><code>FlatExplanation</code></a> represenation of explanations because
+they are the most human-readable.
+But explanations can also be used for automatic testing or translation validation of egraph results,
+so the flat representation is not always necessary.
+In fact, the flattened representation misses the opportunity to share parts of the explanation
+among several different terms.
+Egraphs tend to generate explanations with a large amount of duplication of explanations
+from one term to another, making explanation-sharing very important.
+To solve this problem, <code>egg</code> provides the <a href="../../type.TreeExplanation.html" title="type egg::TreeExplanation"><code>TreeExplanation</code></a> representation.</p>
+<p>Here’s an example <a href="../../type.TreeExplanation.html" title="type egg::TreeExplanation"><code>TreeExplanation</code></a> in string form:</p>
+<div class="example-wrap"><pre class="language-text"><code>(+ 1 (- a (* (- 2 1) a)))
+ (+
+    1
+    (Explanation
+      (- a (* (- 2 1) a))
+      (-
+        a
+        (Explanation
+          (* (- 2 1) a)
+          (* (Explanation (- 2 1) (Rewrite=&gt; constant_fold 1)) a)
+          (Rewrite=&gt; comm-mul (* a 1))
+          (Rewrite&lt;= mul-one a)))
+      (Rewrite=&gt; cancel-sub 0)))
+ (Rewrite=&gt; constant_fold 1)</code></pre></div>
+<p>The big difference between <a href="../../type.FlatExplanation.html" title="type egg::FlatExplanation"><code>FlatExplanation</code></a> and <a href="../../type.TreeExplanation.html" title="type egg::TreeExplanation"><code>TreeExplanation</code></a> is that now
+children of terms can contain explanations themselves.
+So a <a href="../../struct.TreeTerm.html" title="struct egg::TreeTerm"><code>TreeTerm</code></a> can have have each of their children be rewritten from an initial term
+to a final term, making the representation more compact.
+In addition, the string format supports let bindings in order to allow sharing of explantions:</p>
+<div class="example-wrap"><pre class="language-text"><code>(let
+  (v_0 (- 2 1))
+  (let
+    (v_1 (- 2 (Explanation v_0 (Rewrite=&gt; constant_fold 1))))
+    (Explanation
+      (* (- 2 (- 2 1)) (- 2 (- 2 1)))
+      (*
+        (Explanation (- 2 (- 2 1)) v_1 (Rewrite=&gt; constant_fold 1))
+        (Explanation (- 2 (- 2 1)) v_1 (Rewrite=&gt; constant_fold 1)))
+      (Rewrite=&gt; constant_fold 1))))</code></pre></div>
+<p>As you can see, the let binding allows for sharing the term <code>v_1</code>.
+There are other duplicate expressions that could be let bound, but are not because
+<code>egg</code> only binds shared sub-terms found during the explanation generation process.</p>
+<p>Besides the string forms, <a href="../../type.TreeExplanation.html" title="type egg::TreeExplanation"><code>TreeExplanation</code></a> and <a href="../../type.FlatExplanation.html" title="type egg::FlatExplanation"><code>FlatExplanation</code></a> encode the same information
+as Rust objects.
+For proof sharing, each <code>Rc&lt;TreeTerm&gt;</code> in the <a href="../../type.TreeExplanation.html" title="type egg::TreeExplanation"><code>TreeExplanation</code></a> can be checked for pointer
+equality with other terms.</p>
+</div></details></section></div></main></body></html>
