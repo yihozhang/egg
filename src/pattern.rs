@@ -432,7 +432,7 @@ pub(crate) fn apply_pat<L: Language, A: Analysis<L>>(
 
 // ─── StoSearcher / StoApplier for Pattern ────────────────────────────────────
 
-use crate::stochastic::{StoAnalysis, StoApplier, StoSearcher, StoSearchMatch, State};
+use crate::stochastic::{State, StoAnalysis, StoApplier, StoSearchMatch, StoSearcher};
 
 /// Return `true` if the subterms rooted at `id1` and `id2` in `expr` are
 /// structurally identical (same operators, same tree shape, same leaves).

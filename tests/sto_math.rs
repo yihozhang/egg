@@ -1,14 +1,12 @@
 //! Stochastic search tests using a subset of the Math language.
-//!
-//! Each test starts from an expression and checks that greedy MH descent
-//! (temperature = 0) finds a lower-cost expression within a fixed step budget.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use egg::{
     stochastic::{
-        ConstantTemp, MhRunner, SimpleLcg, State, StoAnalysis, StoConditionalApplier,
-        StoRewrite,
+        ConstantBeta, GeometricBeta, MhRunner, SimpleLcg, State, StoAnalysis,
+        StoConditionalApplier, StoRewrite,
     },
     *,
 };
@@ -45,7 +43,7 @@ impl StoAnalysis<Math> for MathCost {
 
     fn cost(enode: &Math, _: &[()], children_cost: &[f64]) -> f64 {
         let op = match enode {
-            Math::Diff(..) | Math::Integral(..) => 100.0,
+            Math::Diff(..) | Math::Integral(..) => 3.0,
             _ => 1.0,
         };
         op + enode.fold(0.0, |acc, c| acc + children_cost[usize::from(c)])
@@ -54,6 +52,95 @@ impl StoAnalysis<Math> for MathCost {
 
 type MathState = State<Math, MathCost>;
 type MathRw = StoRewrite<Math, MathCost>;
+
+fn const_at(state: &MathState, id: Id) -> Option<NotNan<f64>> {
+    match state.rec_expr[id] {
+        Math::Constant(c) => Some(c),
+        _ => None,
+    }
+}
+
+fn fold_math_node(state: &mut MathState, id: Id) -> Option<Id> {
+    match state.rec_expr[id] {
+        Math::Add([a, b]) => {
+            let folded = const_at(state, a)? + const_at(state, b)?;
+            Some(state.add(Math::Constant(folded)))
+        }
+        Math::Sub([a, b]) => {
+            let folded = const_at(state, a)? - const_at(state, b)?;
+            Some(state.add(Math::Constant(folded)))
+        }
+        Math::Mul([a, b]) => {
+            let folded = const_at(state, a)? * const_at(state, b)?;
+            Some(state.add(Math::Constant(folded)))
+        }
+        Math::Div([a, b]) => {
+            let denom = const_at(state, b)?;
+            if denom == 0.0 {
+                None
+            } else {
+                Some(state.add(Math::Constant(const_at(state, a)? / denom)))
+            }
+        }
+        Math::Pow([a, b]) => {
+            let val = const_at(state, a)?
+                .into_inner()
+                .powf(const_at(state, b)?.into_inner());
+            let folded = NotNan::new(val).ok()?;
+            Some(state.add(Math::Constant(folded)))
+        }
+        Math::Ln(a) => {
+            let val = const_at(state, a)?.into_inner().ln();
+            let folded = NotNan::new(val).ok()?;
+            Some(state.add(Math::Constant(folded)))
+        }
+        Math::Sqrt(a) => {
+            let val = const_at(state, a)?.into_inner().sqrt();
+            let folded = NotNan::new(val).ok()?;
+            Some(state.add(Math::Constant(folded)))
+        }
+        Math::Sin(a) => {
+            let val = const_at(state, a)?.into_inner().sin();
+            let folded = NotNan::new(val).ok()?;
+            Some(state.add(Math::Constant(folded)))
+        }
+        Math::Cos(a) => {
+            let val = const_at(state, a)?.into_inner().cos();
+            let folded = NotNan::new(val).ok()?;
+            Some(state.add(Math::Constant(folded)))
+        }
+        _ => None,
+    }
+}
+
+fn normalize_math(state: &mut MathState, root: Id) -> Id {
+    fn rebuild(state: &mut MathState, pos: Id, memo: &mut HashMap<Id, Id>) -> Id {
+        if let Some(&cached) = memo.get(&pos) {
+            return cached;
+        }
+
+        let node = state.rec_expr[pos].clone();
+        let new_children: Vec<Id> = node
+            .children()
+            .iter()
+            .map(|&child| rebuild(state, child, memo))
+            .collect();
+
+        let rebuilt = if node.children() == new_children.as_slice() {
+            pos
+        } else {
+            let mut iter = new_children.into_iter();
+            let new_node = node.map_children(|_| iter.next().unwrap());
+            state.add(new_node)
+        };
+
+        let normalized = fold_math_node(state, rebuilt).unwrap_or(rebuilt);
+        memo.insert(pos, normalized);
+        normalized
+    }
+
+    rebuild(state, root, &mut HashMap::new())
+}
 
 // ─── Rule helpers ─────────────────────────────────────────────────────────────
 
@@ -74,7 +161,10 @@ fn rw_if(
     StoRewrite::new(
         name,
         p(lhs),
-        StoConditionalApplier { applier: Arc::new(p(rhs)), condition: Box::new(cond) },
+        StoConditionalApplier {
+            applier: Arc::new(p(rhs)),
+            condition: Box::new(cond),
+        },
     )
     .unwrap()
 }
@@ -99,9 +189,7 @@ fn is_not_zero(var: &str) -> impl Fn(&MathState, Id, &Subst) -> bool + Send + Sy
 
 fn is_const(var: &str) -> impl Fn(&MathState, Id, &Subst) -> bool + Send + Sync + 'static {
     let v: Var = var.parse().unwrap();
-    move |s: &MathState, _: Id, subst: &Subst| {
-        matches!(s.rec_expr[subst[v]], Math::Constant(_))
-    }
+    move |s: &MathState, _: Id, subst: &Subst| matches!(s.rec_expr[subst[v]], Math::Constant(_))
 }
 
 /// True when `v` and `w` are bound to different positions AND `v` is a
@@ -169,6 +257,12 @@ fn rules() -> Vec<MathRw> {
         rw("d-cos", "(d ?x (cos ?x))", "(* -1 (sin ?x))"),
         rw_if("d-ln", "(d ?x (ln ?x))", "(/ 1 ?x)", is_not_zero("?x")),
 
+        rw_if("d-power",
+            "(d ?x (pow ?f ?g))",
+            "(* (pow ?f ?g) (+ (* (d ?x ?f) (/ ?g ?f)) (* (d ?x ?g) (ln ?f))))",
+            { let nzf = is_not_zero("?f"); let nzg = is_not_zero("?g");
+              move |s, pos, subst| nzf(s, pos, subst) && nzg(s, pos, subst) }),
+
         rw_if("i-power-const", "(i (pow ?x ?c) ?x)",
             "(/ (pow ?x (+ ?c 1)) (+ ?c 1))", is_const("?c")),
         rw("i-one",   "(i 1 ?x)",         "?x"),
@@ -181,16 +275,25 @@ fn rules() -> Vec<MathRw> {
     ]
 }
 
-// ─── Driver ──────────────────────────────────────────────────────────────────
+// ─── Drivers ─────────────────────────────────────────────────────────────────
 
 /// Run pure greedy descent (temperature = 0) from `start` for up to `n_steps`
 /// steps.  Returns the best expression and its cost found during the run.
 fn greedy_best(start: &str, n_steps: u64) -> (RecExpr<Math>, f64) {
     let expr: RecExpr<Math> = start.parse().unwrap();
     let state = MathState::new(expr);
-    let mut runner = MhRunner::new(state, rules());
+    let mut runner = MhRunner::new(state, rules()).with_normalizer(normalize_math);
     let mut rng = SimpleLcg::new(42);
-    runner.run(n_steps, &ConstantTemp(0.0), &mut rng);
+    runner.run(n_steps, &ConstantBeta(0.0), &mut rng);
+    (runner.best_expr.clone(), runner.best_cost)
+}
+
+fn metropolis_best(start: &str, n_steps: u64, beta: f64, seed: u64) -> (RecExpr<Math>, f64) {
+    let expr: RecExpr<Math> = start.parse().unwrap();
+    let state = MathState::new(expr);
+    let mut runner = MhRunner::new(state, rules()).with_normalizer(normalize_math);
+    let mut rng = SimpleLcg::new(seed);
+    runner.run(n_steps, &ConstantBeta(beta), &mut rng);
     (runner.best_expr.clone(), runner.best_cost)
 }
 
@@ -199,21 +302,21 @@ fn greedy_best(start: &str, n_steps: u64) -> (RecExpr<Math>, f64) {
 #[test]
 fn sto_diff_same() {
     // (d x x) → 1  via d-variable  (cost 102 → 1)
-    let (_, cost) = greedy_best("(d x x)", 500);
+    let (_, cost) = metropolis_best("(d x x)", 50000, 1.0, 0);
     assert_eq!(cost, 1.0);
 }
 
 #[test]
 fn sto_diff_different() {
     // (d x y) → 0  via d-constant  (cost 102 → 1)
-    let (_, cost) = greedy_best("(d x y)", 500);
+    let (_, cost) = metropolis_best("(d x y)", 50000, 1.0, 0);
     assert_eq!(cost, 1.0);
 }
 
 #[test]
 fn sto_zero_add() {
     // (+ x 0) → x  via zero-add  (cost 3 → 1)
-    let (_, cost) = greedy_best("(+ x 0)", 500);
+    let (_, cost) = metropolis_best("(+ x 0)", 50000, 1.0, 0);
     assert_eq!(cost, 1.0);
 }
 
@@ -225,20 +328,190 @@ fn sto_powers() {
         let s = MathState::new(expr);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = greedy_best("(* (pow 2 x) (pow 2 y))", 2000);
-    assert!(best < initial, "cost did not decrease: {} vs initial {}", best, initial);
+    let (_, best) = metropolis_best("(* (pow 2 x) (pow 2 y))", 50000, 1.0, 0);
+    assert!(
+        best < initial,
+        "cost did not decrease: {} vs initial {}",
+        best,
+        initial
+    );
+}
+
+#[test]
+fn sto_simplify_add() {
+    // (+ x (+ x (+ x x))) has a lower-cost equivalent, but reaching it usually
+    // needs cost-increasing intermediate rewrites.
+    let initial = {
+        let e: RecExpr<Math> = "(+ x (+ x (+ x x)))".parse().unwrap();
+        let s = MathState::new(e);
+        s.cost[usize::from(s.root())]
+    };
+    let (_, best) = metropolis_best("(+ x (+ x (+ x x)))", 50000, 1.0, 0);
+    assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
 #[test]
 fn sto_diff_sin() {
     // (d x (sin x)) → (cos x)  via d-sin  (cost 103 → 2)
-    let (_, cost) = greedy_best("(d x (sin x))", 500);
+    let (_, cost) = metropolis_best("(d x (sin x))", 50000, 1.0, 0);
     assert_eq!(cost, 2.0);
+}
+
+#[test]
+fn sto_diff_simple2() {
+    // (d x (+ 1 (* y x))) → y
+    let initial = {
+        let e: RecExpr<Math> = "(d x (+ 1 (* y x)))".parse().unwrap();
+        let s = MathState::new(e);
+        s.cost[usize::from(s.root())]
+    };
+    let (_, best) = metropolis_best("(d x (+ 1 (* y x)))", 80_000, 1.0, 42);
+    assert!(best < initial, "expected cost < {}, got {}", initial, best);
+}
+
+#[test]
+fn sto_diff_ln() {
+    // (d x (ln x)) → (/ 1 x)
+    let (_, cost) = metropolis_best("(d x (ln x))", 40000, 1.0, 0);
+    assert_eq!(cost, 3.0);
+}
+
+#[test]
+fn sto_diff_power_simple() {
+    // (d x (pow x 3)) → (* 3 (pow x 2))
+    let initial = {
+        let e: RecExpr<Math> = "(d x (pow x 3))".parse().unwrap();
+        let s = MathState::new(e);
+        s.cost[usize::from(s.root())]
+    };
+    let (_, best) = metropolis_best("(d x (pow x 3))", 80_000, 1.0, 42);
+    assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
 #[test]
 fn sto_integ_cos() {
     // (i (cos x) x) → (sin x)  via i-cos  (cost 103 → 2)
-    let (_, cost) = greedy_best("(i (cos x) x)", 500);
+    let (_, cost) = metropolis_best("(i (cos x) x)", 50000, 1.0, 0);
     assert_eq!(cost, 2.0);
+}
+
+#[test]
+fn sto_integ_one() {
+    // (i 1 x) → x
+    let (_, cost) = metropolis_best("(i 1 x)", 2000, 1.0, 0);
+    assert_eq!(cost, 1.0);
+}
+
+#[test]
+fn sto_integ_sin() {
+    // Keep parity with math.rs naming: integ_sin checks (i (cos x) x) -> (sin x)
+    let (_, cost) = metropolis_best("(i (cos x) x)", 2000, 1.0, 0);
+    assert_eq!(cost, 2.0);
+}
+
+#[test]
+fn sto_simplify_const() {
+    // (+ 1 (- a (* (- 2 1) a))) → 1
+    // Each step reduces cost: cf-sub folds (- 2 1)→1, then one-mul, cancel-sub, zero-add.
+    let (_, cost) = metropolis_best("(+ 1 (- a (* (- 2 1) a)))", 2000, 1.0, 0);
+    assert_eq!(cost, 1.0);
+}
+
+#[test]
+fn sto_integ_x() {
+    // (i (pow x 1) x) → (/ (pow x 2) 2)  via i-power-const then cf-add twice
+    // All steps reduce cost, so greedy descent reaches the target.
+    let (_e, cost) = metropolis_best("(i (pow x 1) x)", 50000, 1.0, 42);
+    assert_eq!(cost, 5.0);
+}
+
+#[test]
+fn sto_diff_simple1() {
+    // (d x (+ 1 (* 2 x))) → 2  (multi-step; intermediate steps raise cost → needs annealing)
+    let initial = {
+        let e: RecExpr<Math> = "(d x (+ 1 (* 2 x)))".parse().unwrap();
+        let s = MathState::new(e);
+        s.cost[usize::from(s.root())]
+    };
+    let (_, best) = metropolis_best("(d x (+ 1 (* 2 x)))", 50_000, 1.0, 42);
+    assert!(best < initial, "expected cost < {}, got {}", initial, best);
+}
+
+#[test]
+fn sto_simplify_root() {
+    // (/ 1 (- (/ (+ 1 (sqrt five)) 2) (/ (- 1 (sqrt five)) 2))) → (/ 1 (sqrt five))
+    let expr = "(/ 1 (- (/ (+ 1 (sqrt five)) 2) (/ (- 1 (sqrt five)) 2)))";
+    let initial = {
+        let e: RecExpr<Math> = expr.parse().unwrap();
+        let s = MathState::new(e);
+        s.cost[usize::from(s.root())]
+    };
+    let (_, best) = metropolis_best(expr, 100_000, 1.0, 42);
+    assert!(best < initial, "expected cost < {}, got {}", initial, best);
+}
+
+#[test]
+fn sto_simplify_factor() {
+    // Adapted from math_simplify_factor for stochastic optimization:
+    // start from expanded form and expect factorization to reduce cost.
+    let expr = "(+ (+ (* x x) (* 4 x)) 3)";
+    let initial = {
+        let e: RecExpr<Math> = expr.parse().unwrap();
+        let s = MathState::new(e);
+        s.cost[usize::from(s.root())]
+    };
+    let (_, best) = metropolis_best(expr, 80_000, 1.0, 42);
+    assert!(best < initial, "expected cost < {}, got {}", initial, best);
+}
+
+#[test]
+fn sto_diff_power_harder() {
+    // (d x (- (pow x 3) (* 7 (pow x 2)))) has a much cheaper equivalent form.
+    let expr = "(d x (- (pow x 3) (* 7 (pow x 2))))";
+    let initial = {
+        let e: RecExpr<Math> = expr.parse().unwrap();
+        let s = MathState::new(e);
+        s.cost[usize::from(s.root())]
+    };
+    let (_, best) = metropolis_best(expr, 50_000, 1.0, 0);
+    assert!(best < initial, "expected cost < {}, got {}", initial, best);
+}
+
+#[test]
+fn sto_integ_part1() {
+    // (i (* x (cos x)) x)  via integration by parts.
+    let expr = "(i (* x (cos x)) x)";
+    let initial = {
+        let e: RecExpr<Math> = expr.parse().unwrap();
+        let s = MathState::new(e);
+        s.cost[usize::from(s.root())]
+    };
+    let (_, best) = metropolis_best(expr, 100_000, 1.0, 42);
+    assert!(best < initial, "expected cost < {}, got {}", initial, best);
+}
+
+#[test]
+fn sto_integ_part2() {
+    // (i (* (cos x) x) x) should also improve via the same identities.
+    let expr = "(i (* (cos x) x) x)";
+    let initial = {
+        let e: RecExpr<Math> = expr.parse().unwrap();
+        let s = MathState::new(e);
+        s.cost[usize::from(s.root())]
+    };
+    let (_, best) = metropolis_best(expr, 100_000, 1.0, 42);
+    assert!(best < initial, "expected cost < {}, got {}", initial, best);
+}
+
+#[test]
+fn sto_integ_part3() {
+    // (i (ln x) x) -> (- (* x (ln x)) x) up to equivalent lower-cost forms.
+    let expr = "(i (ln x) x)";
+    let initial = {
+        let e: RecExpr<Math> = expr.parse().unwrap();
+        let s = MathState::new(e);
+        s.cost[usize::from(s.root())]
+    };
+    let (_, best) = metropolis_best(expr, 120_000, 1.0, 42);
+    assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }

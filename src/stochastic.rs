@@ -21,7 +21,7 @@
 //! At each step it randomly picks a rule, randomly picks a match, applies the
 //! rewrite (via [`State::transplant`]), and accepts or rejects the result
 //! according to the standard MH criterion using [`StoAnalysis::cost`] and a
-//! [`TempSchedule`].
+//! [`BetaSchedule`].
 //!
 //! # Substitutions
 //!
@@ -29,9 +29,9 @@
 //! `rec_expr` — the same role [`Id`]s play as e-class identifiers in the
 //! e-graph interface.  The existing [`Subst`] type is reused directly.
 
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::{collections::HashMap, fmt::Display};
 
 use crate::{Id, Language, RecExpr, Subst, Symbol, Var};
 
@@ -571,44 +571,64 @@ impl StoRng for SimpleLcg {
     }
 }
 
-// ─── TempSchedule ────────────────────────────────────────────────────────────
+// ─── BetaSchedule ────────────────────────────────────────────────────────────
 
-/// A temperature schedule for Metropolis-Hastings / simulated annealing.
-///
-/// The temperature controls acceptance of cost-increasing proposals: at high
-/// temperature almost anything is accepted; at zero only improvements are
-/// accepted (greedy descent).
-pub trait TempSchedule {
-    /// Temperature at the given step number (0-indexed).
-    fn temperature(&self, step: u64) -> f64;
+/// A schedule for beta for Metropolis-Hastings / simulated annealing.
+pub trait BetaSchedule {
+    /// Beta at the given step number (0-indexed).
+    fn beta(&self, step: u64) -> f64;
 }
 
-/// Constant temperature — no annealing.
-pub struct ConstantTemp(pub f64);
+/// Normalization hook run after each proposed rewrite application.
+///
+/// A normalizer receives the proposed full-expression root and may append
+/// additional nodes to `state` (for example, by constant folding), returning
+/// the root of the normalized expression.
+pub trait StoNormalizer<L: Language, A: StoAnalysis<L>> {
+    /// Normalize the expression rooted at `root` and return the new root.
+    fn normalize(&self, state: &mut State<L, A>, root: Id) -> Id;
+}
 
-impl TempSchedule for ConstantTemp {
-    fn temperature(&self, _step: u64) -> f64 {
+impl<L, A, F> StoNormalizer<L, A> for F
+where
+    L: Language,
+    A: StoAnalysis<L>,
+    F: Fn(&mut State<L, A>, Id) -> Id,
+{
+    fn normalize(&self, state: &mut State<L, A>, root: Id) -> Id {
+        self(state, root)
+    }
+}
+
+struct NoopNormalizer;
+
+impl<L: Language, A: StoAnalysis<L>> StoNormalizer<L, A> for NoopNormalizer {
+    fn normalize(&self, _state: &mut State<L, A>, root: Id) -> Id {
+        root
+    }
+}
+
+pub struct ConstantBeta(pub f64);
+
+impl BetaSchedule for ConstantBeta {
+    fn beta(&self, _step: u64) -> f64 {
         self.0
     }
 }
 
-/// Geometrically-decaying temperature: `initial × factor^step`.
+/// Geometric beta: `initial × factor^step`.
 ///
 /// With `factor < 1.0` this converges toward greedy descent.
-pub struct GeometricTemp {
-    /// Starting temperature (at step 0).
+pub struct GeometricBeta {
+    /// Starting beta (at step 0).
     pub initial: f64,
-    /// Multiplicative decay per step; use a value in `(0, 1)` for annealing.
+    /// Multiplicative decay per step; factor should be greater than 0
     pub factor: f64,
 }
 
-impl TempSchedule for GeometricTemp {
-    fn temperature(&self, step: u64) -> f64 {
-        if step <= i32::MAX as u64 {
-            self.initial * self.factor.powi(step as i32)
-        } else {
-            self.initial * self.factor.powf(step as f64)
-        }
+impl BetaSchedule for GeometricBeta {
+    fn beta(&self, step: u64) -> f64 {
+        self.initial * self.factor.powi(step as i32)
     }
 }
 
@@ -633,13 +653,8 @@ pub struct MhStepResult {
 ///   of `state` only needs to preserve `current_root`.
 ///
 /// At each step ([`MhRunner::step`]) all matches from every rule are collected
-/// and one is sampled uniformly.  The rewrite is applied and accepted/rejected
-/// via:
-///
-/// ```text
-/// accept if new_cost ≤ current_cost,
-/// else accept with probability exp((current_cost − new_cost) / temperature).
-/// ```
+/// and scored via an exponential race that prefers lower-cost proposals while
+/// still allowing uphill moves when beta is positive.
 ///
 /// Node costs are read directly from [`State::cost`] — O(1) per step.
 pub struct MhRunner<L: Language, A: StoAnalysis<L>> {
@@ -656,9 +671,10 @@ pub struct MhRunner<L: Language, A: StoAnalysis<L>> {
     /// Number of [`step`][MhRunner::step] calls made so far.
     pub step_count: u64,
     rules: Vec<StoRewrite<L, A>>,
+    normalizer: Arc<dyn StoNormalizer<L, A> + Send + Sync>,
 }
 
-impl<L: Language, A: StoAnalysis<L>> MhRunner<L, A> {
+impl<L: Language + Display, A: StoAnalysis<L>> MhRunner<L, A> {
     /// Create a new [`MhRunner`] from an initial state and rules.
     pub fn new(state: State<L, A>, rules: Vec<StoRewrite<L, A>>) -> Self {
         let current_root = state.root();
@@ -672,114 +688,127 @@ impl<L: Language, A: StoAnalysis<L>> MhRunner<L, A> {
             best_cost: current_cost,
             step_count: 0,
             rules,
+            normalizer: Arc::new(NoopNormalizer),
         }
+    }
+
+    /// Set a post-rewrite normalizer invoked on every proposed expression.
+    ///
+    /// The normalizer runs after a rewrite is transplanted into the full term
+    /// and before MH acceptance is evaluated.
+    pub fn with_normalizer(
+        mut self,
+        normalizer: impl StoNormalizer<L, A> + Send + Sync + 'static,
+    ) -> Self {
+        self.normalizer = Arc::new(normalizer);
+        self
     }
 
     /// Perform one Metropolis-Hastings step.
     ///
-    /// 1. Collect all matches from every rule within the subtree rooted at
-    ///    `current_root`.
-    /// 2. Sample one match uniformly at random.
-    /// 3. Apply the rewrite to produce a new subterm root.
-    /// 4. [`transplant`][State::transplant] the new subterm into the full
-    ///    expression.
-    /// 5. Accept with probability `min(1, exp((current_cost − new_cost) / T))`.
-    /// 6. If a new best is found, snapshot `best_expr`.
-    /// 7. Compact the state if the dead-to-live ratio is high.
+    /// 1. Initialize a race with the current expression as incumbent.
+    /// 2. Enumerate every rewrite match in the subtree rooted at `current_root`.
+    /// 3. Build each proposal and compute its cost.
+    /// 4. Draw an exponential nonce and scale it by the proposal's inverse
+    ///    weight, where worse costs are penalized by temperature.
+    /// 5. Keep the proposal with the smallest scaled nonce.
+    /// 6. Move to that winner, update best-so-far, and compact if beneficial.
     ///
     /// Returns `None` if there are no rules; otherwise always returns
     /// `Some(MhStepResult)` — with `accepted = false` when no match was found
     /// or the proposal was rejected.
-    pub fn step<T: TempSchedule>(&mut self, schedule: &T, rng: &mut impl StoRng) -> Option<MhStepResult> {
-        if self.rules.is_empty() {
-            return None;
-        }
+    pub fn step<T: BetaSchedule>(&mut self, schedule: &T, rng: &mut impl StoRng) -> MhStepResult {
+        assert!(!self.rules.is_empty());
 
-        let temp = schedule.temperature(self.step_count);
+        let beta = schedule.beta(self.step_count);
         self.step_count += 1;
 
-        // ── 1–2. Reservoir-sample one (applier, match) pair uniformly ─────────
-        // Scanning all rules and positions with a size-1 reservoir avoids
-        // building a Vec of all matches, reducing allocations on the hot path.
-        let mut chosen: Option<(Arc<dyn StoApplier<L, A> + Send + Sync>, StoSearchMatch)> = None;
-        let mut total = 0usize;
+        let mut sample_exp1 = || {
+            let u = rng.gen_float();
+            let u = u.clamp(f64::MIN_POSITIVE, 1.0 - f64::EPSILON);
+            -(-u.ln()).ln()
+        };
+
+        // Incumbent starts as the current state.
+        // sample_exp1();
+        let mut selected_nonce = sample_exp1();
+        let mut selected_root = self.current_root;
+        let mut selected_cost = self.current_cost;
+
+        // Enumerate all proposals without storing them: maintain only the
+        // current race winner.
         for rule in &self.rules {
             for m in rule.searcher.search_rooted(&self.state, self.current_root) {
-                total += 1;
-                if rng.gen_index(total) == 0 {
-                    chosen = Some((Arc::clone(&rule.applier), m));
+                let Some(new_subterm) = rule.applier.apply_one(&mut self.state, m.pos, &m.substs)
+                else {
+                    continue;
+                };
+
+                let proposed_root = self.state.transplant(self.current_root, m.pos, new_subterm);
+                let proposed_root = self.normalizer.normalize(&mut self.state, proposed_root);
+                let proposed_cost = self.state.cost[usize::from(proposed_root)];
+
+                let weight = -beta * (proposed_cost - self.current_cost);
+                let nonce = weight + sample_exp1();
+                // println!(
+                //     "Rule `{}`: proposed term {} with weight {}, nonce {}",
+                //     rule.name,
+                //     self.state.rec_expr.extract(proposed_root).pretty(80),
+                //     weight,
+                //     nonce
+                // );
+                if nonce > selected_nonce {
+                    selected_nonce = nonce;
+                    selected_root = proposed_root;
+                    selected_cost = proposed_cost;
                 }
             }
         }
 
-        let (applier, chosen_match) = match chosen {
-            None => {
-                return Some(MhStepResult {
-                    accepted: false,
-                    proposed_cost: self.current_cost,
-                });
-            }
-            Some(pair) => pair,
-        };
+        // println!("{}", self.state.rec_expr.extract(selected_root).pretty(80));
 
-        // ── 3. Apply the rewrite ──────────────────────────────────────────────
-        let new_subterm =
-            match applier.apply_one(&mut self.state, chosen_match.pos, &chosen_match.substs) {
-                Some(id) => id,
-                None => {
-                    return Some(MhStepResult {
-                        accepted: false,
-                        proposed_cost: self.current_cost,
-                    });
-                }
-            };
-
-        // ── 4. Transplant into the full expression ────────────────────────────
-        let proposed_root = self
-            .state
-            .transplant(self.current_root, chosen_match.pos, new_subterm);
-
-        // ── 5. MH acceptance ──────────────────────────────────────────────────
-        let proposed_cost = self.state.cost[usize::from(proposed_root)];
-
-        let accepted = if proposed_cost <= self.current_cost {
-            true
-        } else if temp <= 0.0 {
-            false
-        } else {
-            let delta = proposed_cost - self.current_cost;
-            rng.gen_float() < (-delta / temp).exp()
-        };
+        let accepted = selected_root != self.current_root;
 
         if accepted {
-            self.current_root = proposed_root;
-            self.current_cost = proposed_cost;
+            self.current_root = selected_root;
+            self.current_cost = selected_cost;
 
-            if proposed_cost < self.best_cost {
-                self.best_expr = self.state.rec_expr.extract(proposed_root);
-                self.best_cost = proposed_cost;
+            // ── 6. Snapshot best ─────────────────────────────────────────────
+            // Copy the expression out of the state so compaction only needs to
+            // track current_root — no multi-root bookkeeping required.
+            if selected_cost < self.best_cost {
+                self.best_expr = self.state.rec_expr.extract(selected_root);
+                self.best_cost = selected_cost;
             }
         }
 
+        // ── 7. Compact if beneficial ──────────────────────────────────────────
         if self.state.should_compact_from(self.current_root) {
             let new_ids = self.state.compact_keeping(&[self.current_root]);
             self.current_root = new_ids[0];
         }
 
-        Some(MhStepResult {
+        MhStepResult {
             accepted,
-            proposed_cost,
-        })
+            proposed_cost: selected_cost,
+        }
     }
 
     /// Run the MH chain for exactly `n_steps` steps.
     ///
     /// Returns early if there are no rules.
-    pub fn run<T: TempSchedule>(&mut self, n_steps: u64, schedule: &T, rng: &mut impl StoRng) {
-        for _ in 0..n_steps {
-            if self.step(schedule, rng).is_none() {
-                break;
+    pub fn run<T: BetaSchedule>(&mut self, n_steps: u64, schedule: &T, rng: &mut impl StoRng) {
+        for i in 0..n_steps {
+            if i % 1000 == 0 {
+                eprintln!(
+                    "Step {}: current cost = {}, best cost = {}, state size = {}",
+                    i,
+                    self.current_cost,
+                    self.best_cost,
+                    self.state.len()
+                );
             }
+            self.step(schedule, rng);
         }
     }
 
