@@ -91,6 +91,14 @@ pub trait StoAnalysis<L: Language>: Sized {
     /// The default does nothing.
     #[allow(unused_variables)]
     fn modify(state: &mut State<L, Self>, pos: Id) {}
+
+    /// Remap any [`Id`]s stored inside `data` after a compaction.
+    ///
+    /// `remap[old_idx]` gives the new index for a node that was at `old_idx`
+    /// before compaction.  Called for every surviving node's data entry.
+    /// The default is a no-op (suitable when `Data` contains no `Id`s).
+    #[allow(unused_variables)]
+    fn remap_data(data: &mut Self::Data, remap: &[u32]) {}
 }
 
 /// No-op analysis; stores `()` for every node.
@@ -319,7 +327,9 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
                 .clone()
                 .map_children(|child| Id::from(remap[usize::from(child)] as usize));
             new_nodes.push(node);
-            new_analysis.push(self.analysis[old_idx].clone());
+            let mut data = self.analysis[old_idx].clone();
+            A::remap_data(&mut data, &remap);
+            new_analysis.push(data);
             new_size.push(self.size[old_idx]);
             new_cost.push(self.cost[old_idx]);
         }
@@ -799,15 +809,15 @@ impl<L: Language + Display, A: StoAnalysis<L>> MhRunner<L, A> {
     /// Returns early if there are no rules.
     pub fn run<T: BetaSchedule>(&mut self, n_steps: u64, schedule: &T, rng: &mut impl StoRng) {
         for i in 0..n_steps {
-            if i % 1000 == 0 {
-                eprintln!(
-                    "Step {}: current cost = {}, best cost = {}, state size = {}",
-                    i,
-                    self.current_cost,
-                    self.best_cost,
-                    self.state.len()
-                );
-            }
+            // if i % 1000 == 0 {
+            //     eprintln!(
+            //         "Step {}: current cost = {}, best cost = {}, state size = {}",
+            //         i,
+            //         self.current_cost,
+            //         self.best_cost,
+            //         self.state.len()
+            //     );
+            // }
             self.step(schedule, rng);
         }
     }

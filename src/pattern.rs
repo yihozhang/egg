@@ -439,7 +439,7 @@ use crate::stochastic::{State, StoAnalysis, StoApplier, StoSearchMatch, StoSearc
 ///
 /// Used for non-linear pattern variables: once `?x` is bound to a position,
 /// every later occurrence must root an identical subterm.
-fn structurally_equal<L: Language>(expr: &RecExpr<L>, id1: Id, id2: Id) -> bool {
+pub fn structurally_equal<L: Language>(expr: &RecExpr<L>, id1: Id, id2: Id) -> bool {
     if id1 == id2 {
         return true; // same position ⟹ identical by construction
     }

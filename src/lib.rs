@@ -99,7 +99,7 @@ pub use {
     extract::*,
     language::*,
     multipattern::*,
-    pattern::{ENodeOrVar, Pattern, PatternAst, SearchMatches},
+    pattern::{structurally_equal, ENodeOrVar, Pattern, PatternAst, SearchMatches},
     rewrite::{Applier, Condition, ConditionEqual, ConditionalApplier, Rewrite, Searcher},
     run::*,
     subst::{Subst, Var},
