@@ -248,11 +248,16 @@ fn rules() -> Vec<MathRw> {
 
 // ─── Drivers ─────────────────────────────────────────────────────────────────
 
-fn metropolis_best(start: &str, n_steps: u64, beta: f64, seed: u64) -> (RecExpr<Math>, f64) {
+fn metropolis_best(start: &str, n_steps: u64, beta: Option<f64>) -> (RecExpr<Math>, f64) {
     let expr: RecExpr<Math> = start.parse().unwrap();
     let mut runner = StoRunner::new(expr, rules()).with_normalizer(normalize_math);
-    let mut rng = SimpleLcg::new(seed);
-    runner.run(n_steps, &PeriodicBeta, &mut rng);
+    let mut rng = SimpleLcg::new(0);
+    if let Some(beta) = beta {
+        runner.run(n_steps, &ConstantBeta(beta), &mut rng);
+    } else {
+        runner.run(n_steps, &PeriodicBeta, &mut rng);
+    };
+
     (runner.best_expr.clone(), runner.best_cost)
 }
 
@@ -261,21 +266,21 @@ fn metropolis_best(start: &str, n_steps: u64, beta: f64, seed: u64) -> (RecExpr<
 #[test]
 fn sto_diff_same() {
     // (d x x) → 1  via d-variable  (cost 102 → 1)
-    let (_, cost) = metropolis_best("(d x x)", 50000, 1.0, 0);
+    let (_, cost) = metropolis_best("(d x x)", 50000, None);
     assert_eq!(cost, 1.0);
 }
 
 #[test]
 fn sto_diff_different() {
     // (d x y) → 0  via d-constant  (cost 102 → 1)
-    let (_, cost) = metropolis_best("(d x y)", 50000, 1.0, 0);
+    let (_, cost) = metropolis_best("(d x y)", 50000, None);
     assert_eq!(cost, 1.0);
 }
 
 #[test]
 fn sto_zero_add() {
     // (+ x 0) → x  via zero-add  (cost 3 → 1)
-    let (_, cost) = metropolis_best("(+ x 0)", 50000, 1.0, 0);
+    let (_, cost) = metropolis_best("(+ x 0)", 50000, None);
     assert_eq!(cost, 1.0);
 }
 
@@ -287,7 +292,7 @@ fn sto_powers() {
         let s = MathState::new(expr);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best("(* (pow 2 x) (pow 2 y))", 50000, 1.0, 0);
+    let (_, best) = metropolis_best("(* (pow 2 x) (pow 2 y))", 50000, None);
     assert!(
         best < initial,
         "cost did not decrease: {} vs initial {}",
@@ -305,14 +310,14 @@ fn sto_simplify_add() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best("(+ x (+ x (+ x x)))", 1_000_000, 1.0, 0);
+    let (_, best) = metropolis_best("(+ x (+ x (+ x x)))", 1_000_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
 #[test]
 fn sto_diff_sin() {
     // (d x (sin x)) → (cos x)  via d-sin  (cost 103 → 2)
-    let (_, cost) = metropolis_best("(d x (sin x))", 50000, 1.0, 0);
+    let (_, cost) = metropolis_best("(d x (sin x))", 50000, None);
     assert_eq!(cost, 2.0);
 }
 
@@ -324,14 +329,14 @@ fn sto_diff_simple2() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best("(d x (+ 1 (* y x)))", 80_000, 1.0, 42);
+    let (_, best) = metropolis_best("(d x (+ 1 (* y x)))", 80_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
 #[test]
 fn sto_diff_ln() {
     // (d x (ln x)) → (/ 1 x)
-    let (_, cost) = metropolis_best("(d x (ln x))", 40000, 1.0, 0);
+    let (_, cost) = metropolis_best("(d x (ln x))", 40000, None);
     assert_eq!(cost, 3.0);
 }
 
@@ -343,28 +348,28 @@ fn sto_diff_power_simple() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best("(d x (pow x 3))", 80_000, 1.0, 42);
+    let (_, best) = metropolis_best("(d x (pow x 3))", 80_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
 #[test]
 fn sto_integ_cos() {
     // (i (cos x) x) → (sin x)  via i-cos  (cost 103 → 2)
-    let (_, cost) = metropolis_best("(i (cos x) x)", 50000, 1.0, 0);
+    let (_, cost) = metropolis_best("(i (cos x) x)", 50000, None);
     assert_eq!(cost, 2.0);
 }
 
 #[test]
 fn sto_integ_one() {
     // (i 1 x) → x
-    let (_, cost) = metropolis_best("(i 1 x)", 2000, 1.0, 0);
+    let (_, cost) = metropolis_best("(i 1 x)", 2000, None);
     assert_eq!(cost, 1.0);
 }
 
 #[test]
 fn sto_integ_sin() {
     // Keep parity with math.rs naming: integ_sin checks (i (cos x) x) -> (sin x)
-    let (_, cost) = metropolis_best("(i (cos x) x)", 2000, 1.0, 0);
+    let (_, cost) = metropolis_best("(i (cos x) x)", 2000, None);
     assert_eq!(cost, 2.0);
 }
 
@@ -372,7 +377,7 @@ fn sto_integ_sin() {
 fn sto_simplify_const() {
     // (+ 1 (- a (* (- 2 1) a))) → 1
     // Each step reduces cost: cf-sub folds (- 2 1)→1, then one-mul, cancel-sub, zero-add.
-    let (_, cost) = metropolis_best("(+ 1 (- a (* (- 2 1) a)))", 2000, 1.0, 0);
+    let (_, cost) = metropolis_best("(+ 1 (- a (* (- 2 1) a)))", 2000, None);
     assert_eq!(cost, 1.0);
 }
 
@@ -380,7 +385,7 @@ fn sto_simplify_const() {
 fn sto_integ_x() {
     // (i (pow x 1) x) → (/ (pow x 2) 2)  via i-power-const then cf-add twice
     // All steps reduce cost, so greedy descent reaches the target.
-    let (_e, cost) = metropolis_best("(i (pow x 1) x)", 50000, 1.0, 42);
+    let (_e, cost) = metropolis_best("(i (pow x 1) x)", 50000, None);
     assert_eq!(cost, 5.0);
 }
 
@@ -392,7 +397,7 @@ fn sto_diff_simple1() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best("(d x (+ 1 (* 2 x)))", 50_000, 1.0, 42);
+    let (_, best) = metropolis_best("(d x (+ 1 (* 2 x)))", 50_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
@@ -405,7 +410,7 @@ fn sto_simplify_root() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best(expr, 100_000, 1.0, 42);
+    let (_, best) = metropolis_best(expr, 100_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
@@ -419,7 +424,7 @@ fn sto_simplify_factor() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best(expr, 80_000, 1.0, 42);
+    let (_, best) = metropolis_best(expr, 80_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
@@ -432,7 +437,7 @@ fn sto_diff_power_harder() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best(expr, 50_000, 1.0, 0);
+    let (_, best) = metropolis_best(expr, 50_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
@@ -445,7 +450,7 @@ fn sto_integ_part1() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best(expr, 100_000, 1.0, 42);
+    let (_, best) = metropolis_best(expr, 100_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
@@ -458,7 +463,7 @@ fn sto_integ_part2() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best(expr, 1_000_000, 1.0, 42);
+    let (_, best) = metropolis_best(expr, 1_000_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
@@ -471,6 +476,6 @@ fn sto_integ_part3() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best(expr, 1_000_000, 1.0, 42);
+    let (_, best) = metropolis_best(expr, 1_000_000, Some(1.0));
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }

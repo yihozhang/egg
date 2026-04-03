@@ -247,11 +247,11 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
 
         let pos = usize::from(pos);
         if self.analysis.len() <= pos {
-            self.analysis.resize(pos + 1, data.clone());
+            self.analysis.resize(pos + 1, data);
             self.size.resize(pos + 1, sz);
             self.cost.resize(pos + 1, c);
         } else {
-            self.analysis[pos] = data.clone();
+            self.analysis[pos] = data;
             self.size[pos] = sz;
             self.cost[pos] = c;
         }
@@ -399,21 +399,6 @@ pub trait StoSearcher<L: Language, A: StoAnalysis<L>> {
     ///
     /// Returns `None` if there is no match at that position.
     fn search_pos(&self, state: &State<L, A>, pos: Id) -> Option<StoSearchMatch>;
-
-    /// Search only the subtree reachable from `root`.
-    ///
-    /// Used by [`StoRunner`] so that proposals are confined to the currently
-    /// accepted expression.  The default does a DFS from `root` and calls
-    /// [`search_pos`][Self::search_pos] at each reachable position.
-    fn search_rooted(&self, state: &State<L, A>, root: Id) -> Vec<StoSearchMatch> {
-        let n = state.len();
-        reachable_from(&state.rec_expr, root, n)
-            .into_iter()
-            .enumerate()
-            .filter(|&(_, reachable)| reachable)
-            .filter_map(|(i, _)| self.search_pos(state, Id::from(i)))
-            .collect()
-    }
 
     /// Return every [`Var`] that this searcher can bind in a substitution.
     fn vars(&self) -> Vec<Var>;
@@ -688,6 +673,10 @@ pub struct StoRunner<L: Language, A: StoAnalysis<L>> {
     pub best_cost: f64,
     /// Number of [`step`][StoRunner::step] calls made so far.
     pub step_count: u64,
+    /// Total number of proposals generated across all steps (for logging / diagnostics).
+    pub n_proposed: u64,
+    /// Total number of proposals accepted across all steps (for logging / diagnostics).
+    pub n_accepted: u64,
     rules: Vec<StoRewrite<L, A>>,
     normalizer: Arc<dyn StoNormalizer<L, A> + Send + Sync>,
 }
@@ -707,6 +696,8 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
             best_expr,
             best_cost: current_cost,
             step_count: 0,
+            n_proposed: 0,
+            n_accepted: 0,
             rules,
             normalizer: Arc::new(NoopNormalizer),
         }
@@ -783,13 +774,29 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
 
         // Enumerate all proposals without storing them: maintain only the
         // current race winner.
+
+        let reachable = reachable_from(&self.state.rec_expr, self.current_root, self.state.len());
+        let reachable = reachable
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, reachable)| reachable)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        let search_rooted =
+            |state: &State<L, A>, searcher: &Arc<dyn StoSearcher<L, A> + Send + Sync + 'static>| {
+                reachable
+                    .iter()
+                    .filter_map(|i| searcher.search_pos(state, Id::from(*i)))
+                    .collect::<Vec<_>>()
+            };
         let rules = mem::take(&mut self.rules);
         for rule in &rules {
-            for m in rule.searcher.search_rooted(&self.state, self.current_root) {
+            for m in search_rooted(&self.state, &rule.searcher) {
                 let Some(new_subterm) = rule.applier.apply_one(&mut self.state, m.pos, &m.substs)
                 else {
                     continue;
                 };
+                self.n_proposed += 1;
                 self.normalize(new_subterm);
 
                 let current_subterm_cost = self.state.cost[usize::from(m.pos)];
@@ -811,15 +818,13 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
                 .transplant(&mut self.current_root, old_pos, new_subterm);
             self.normalize(self.current_root);
             selected_cost = self.state.cost[usize::from(self.current_root)];
+            self.n_accepted += 1;
         }
 
         let accepted = selected_cost < self.current_cost;
         if accepted {
             self.current_cost = selected_cost;
 
-            // ── 6. Snapshot best ─────────────────────────────────────────────
-            // Copy the expression out of the state so compaction only needs to
-            // track current_root — no multi-root bookkeeping required.
             if selected_cost < self.best_cost {
                 self.best_expr = self.state.rec_expr.extract(self.current_root);
                 self.best_cost = selected_cost;
@@ -845,11 +850,7 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
         let mut stall = 0;
         for _ in 0..n_steps {
             let result = self.step(schedule, rng);
-            if result.accepted {
-                stall = 0;
-            } else {
-                stall += 1;
-            }
+            stall += !result.accepted as u64;
             if stall >= 10000 {
                 self.state = State::new(self.initial_expr.clone());
                 self.current_root = self.state.root();
@@ -857,6 +858,10 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
                 stall = 0;
             }
         }
+        println!(
+            "MH finished: best cost = {}, # proposed = {}, # accepted = {}",
+            self.best_cost, self.n_proposed, self.n_accepted,
+        );
     }
 
     /// Extract the current (most recently accepted) expression as a standalone [`RecExpr`].
