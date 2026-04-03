@@ -633,13 +633,42 @@ impl BetaSchedule for PeriodicBeta {
     }
 }
 
+// ─── StoConfig ───────────────────────────────────────────────────────────────
+
+/// Configuration for [`StoRunner::run`].
+pub struct StoConfig {
+    /// Restart after this many consecutive non-improving iterations.
+    /// Default: [`usize::MAX`] (never restart due to stalling).
+    pub max_stall: usize,
+    /// Maximum number of restarts before stopping.
+    /// Default: [`usize::MAX`] (unlimited restarts).
+    pub max_restart: usize,
+    /// Maximum total iterations.
+    /// Default: [`usize::MAX`] (run indefinitely).
+    pub max_iter: usize,
+    /// Beta schedule for Metropolis-Hastings acceptance.
+    /// Default: constant beta of 1.0.
+    pub beta_schedule: Box<dyn BetaSchedule>,
+}
+
+impl Default for StoConfig {
+    fn default() -> Self {
+        Self {
+            max_stall: usize::MAX,
+            max_restart: usize::MAX,
+            max_iter: usize::MAX,
+            beta_schedule: Box::new(ConstantBeta(1.0)),
+        }
+    }
+}
+
 // ─── StoRunner ────────────────────────────────────────────────────────────────
 
 /// The result of a single Metropolis-Hastings step.
 #[derive(Debug, Clone)]
 pub struct MhStepResult {
-    /// Whether the proposed rewrite was accepted.
-    pub accepted: bool,
+    /// Whether the proposed rewrite improved the current expression.
+    pub improved: bool,
     /// The cost of the proposed expression.
     pub proposed_cost: f64,
 }
@@ -754,7 +783,7 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
     }
 
     /// Perform one Metropolis-Hastings step.
-    pub fn step<T: BetaSchedule>(&mut self, schedule: &T, rng: &mut impl StoRng) -> MhStepResult {
+    pub fn step<T: BetaSchedule + ?Sized>(&mut self, schedule: &T, rng: &mut impl StoRng) -> MhStepResult {
         assert!(!self.rules.is_empty());
 
         let beta = schedule.beta(self.step_count);
@@ -821,8 +850,8 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
             self.n_accepted += 1;
         }
 
-        let accepted = selected_cost < self.current_cost;
-        if accepted {
+        let improved = selected_cost < self.current_cost;
+        if improved {
             self.current_cost = selected_cost;
 
             if selected_cost < self.best_cost {
@@ -838,24 +867,31 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
         }
 
         MhStepResult {
-            accepted,
+            improved: improved,
             proposed_cost: selected_cost,
         }
     }
 
-    /// Run the MH chain for exactly `n_steps` steps.
+    /// Run the MH chain according to the given [`StoConfig`].
     ///
-    /// Returns early if there are no rules.
-    pub fn run<T: BetaSchedule>(&mut self, n_steps: u64, schedule: &T, rng: &mut impl StoRng) {
-        let mut stall = 0;
-        for _ in 0..n_steps {
-            let result = self.step(schedule, rng);
-            stall += !result.accepted as u64;
-            if stall >= 10000 {
+    /// Stops when `max_iter` iterations have been run, when `max_restart`
+    /// restarts have occurred, or when `max_stall` consecutive non-improving
+    /// iterations are reached and no further restarts are allowed.
+    pub fn run(&mut self, config: StoConfig, rng: &mut impl StoRng) {
+        let mut stall = 0usize;
+        let mut restarts = 0usize;
+        for _ in 0..config.max_iter {
+            let result = self.step(config.beta_schedule.as_ref(), rng);
+            stall += !result.improved as usize;
+            if stall >= config.max_stall {
+                if restarts >= config.max_restart {
+                    break;
+                }
                 self.state = State::new(self.initial_expr.clone());
                 self.current_root = self.state.root();
                 self.current_cost = self.state.cost[usize::from(self.current_root)];
                 stall = 0;
+                restarts += 1;
             }
         }
         println!(

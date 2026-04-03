@@ -6,7 +6,7 @@ use std::sync::Arc;
 use egg::{
     stochastic::{
         ConstantBeta, GeometricBeta, PeriodicBeta, SimpleLcg, State, StoAnalysis,
-        StoConditionalApplier, StoRewrite, StoRunner,
+        StoConditionalApplier, StoConfig, StoRewrite, StoRunner,
     },
     *,
 };
@@ -252,11 +252,16 @@ fn metropolis_best(start: &str, n_steps: u64, beta: Option<f64>) -> (RecExpr<Mat
     let expr: RecExpr<Math> = start.parse().unwrap();
     let mut runner = StoRunner::new(expr, rules()).with_normalizer(normalize_math);
     let mut rng = SimpleLcg::new(0);
-    if let Some(beta) = beta {
-        runner.run(n_steps, &ConstantBeta(beta), &mut rng);
-    } else {
-        runner.run(n_steps, &PeriodicBeta, &mut rng);
+    let config = StoConfig {
+        max_iter: n_steps as usize,
+        beta_schedule: if let Some(b) = beta {
+            Box::new(ConstantBeta(b))
+        } else {
+            Box::new(PeriodicBeta)
+        },
+        ..StoConfig::default()
     };
+    runner.run(config, &mut rng);
 
     (runner.best_expr.clone(), runner.best_cost)
 }
