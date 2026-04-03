@@ -476,6 +476,6 @@ fn sto_integ_part3() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best(expr, 1_000_000, Some(1.0));
+    let (_, best) = metropolis_best(expr, 1_000_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
