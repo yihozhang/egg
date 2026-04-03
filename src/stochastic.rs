@@ -301,9 +301,9 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
     /// # Panics
     ///
     /// Panics if `roots` is empty or contains an out-of-bounds [`Id`].
-    pub fn compact_keeping(&mut self, roots: &[Id]) -> Vec<Id> {
+    pub fn compact_keeping(&mut self, root: Id) -> Id {
         let n = self.len();
-        let reachable = reachable_from(&self.rec_expr, roots, n);
+        let reachable = reachable_from(&self.rec_expr, root, n);
 
         // Collect live indices in ascending order (preserves topological order).
         let order: Vec<usize> = (0..n).filter(|&i| reachable[i]).collect();
@@ -338,10 +338,7 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
         self.size = new_size;
         self.cost = new_cost;
 
-        roots
-            .iter()
-            .map(|&r| Id::from(remap[usize::from(r)] as usize))
-            .collect()
+        Id::from(remap[usize::from(root)] as usize)
     }
 
     /// Compact the state keeping only nodes reachable from `self.root()`.
@@ -349,7 +346,7 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
     /// See [`compact_keeping`][State::compact_keeping] for the general form.
     pub fn compact(&mut self) {
         let root = self.root();
-        self.compact_keeping(&[root]);
+        self.compact_keeping(root);
     }
 }
 
@@ -357,19 +354,17 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
 
 /// Return a boolean mask of length `n` where `mask[i]` is `true` iff node `i`
 /// is reachable from at least one node in `roots`.
-fn reachable_from<L: Language>(rec_expr: &RecExpr<L>, roots: &[Id], n: usize) -> Vec<bool> {
+fn reachable_from<L: Language>(rec_expr: &RecExpr<L>, root: Id, n: usize) -> Vec<bool> {
     let mut visited = vec![false; n];
-    for &root in roots {
-        let mut stack = Vec::with_capacity(n);
-        stack.push(usize::from(root));
-        while let Some(i) = stack.pop() {
-            if visited[i] {
-                continue;
-            }
-            visited[i] = true;
-            for &child in rec_expr[Id::from(i)].children() {
-                stack.push(usize::from(child));
-            }
+    let mut stack = Vec::with_capacity(n);
+    stack.push(usize::from(root));
+    while let Some(i) = stack.pop() {
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        for &child in rec_expr[Id::from(i)].children() {
+            stack.push(usize::from(child));
         }
     }
     visited
@@ -412,7 +407,7 @@ pub trait StoSearcher<L: Language, A: StoAnalysis<L>> {
     /// [`search_pos`][Self::search_pos] at each reachable position.
     fn search_rooted(&self, state: &State<L, A>, root: Id) -> Vec<StoSearchMatch> {
         let n = state.len();
-        reachable_from(&state.rec_expr, &[root], n)
+        reachable_from(&state.rec_expr, root, n)
             .into_iter()
             .enumerate()
             .filter(|&(_, reachable)| reachable)
@@ -833,8 +828,8 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
 
         // ── 7. Compact if beneficial ──────────────────────────────────────────
         if self.state.should_compact_from(self.current_root) {
-            let new_ids = self.state.compact_keeping(&[self.current_root]);
-            self.current_root = new_ids[0];
+            let new_id = self.state.compact_keeping(self.current_root);
+            self.current_root = new_id;
         }
 
         MhStepResult {
