@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use egg::{
     stochastic::{
-        ConstantBeta, GeometricBeta, MhRunner, SimpleLcg, State, StoAnalysis,
-        StoConditionalApplier, StoRewrite,
+        ConstantBeta, GeometricBeta, PeriodicBeta, SimpleLcg, State, StoAnalysis,
+        StoConditionalApplier, StoRewrite, StoRunner,
     },
     *,
 };
@@ -43,7 +43,7 @@ impl StoAnalysis<Math> for MathCost {
 
     fn cost(enode: &Math, _: &[()], children_cost: &[f64]) -> f64 {
         let op = match enode {
-            Math::Diff(..) | Math::Integral(..) => 3.0,
+            Math::Diff(..) | Math::Integral(..) => 4.0,
             _ => 1.0,
         };
         op + enode.fold(0.0, |acc, c| acc + children_cost[usize::from(c)])
@@ -60,26 +60,26 @@ fn const_at(state: &MathState, id: Id) -> Option<NotNan<f64>> {
     }
 }
 
-fn fold_math_node(state: &mut MathState, id: Id) -> Option<Id> {
-    match state.rec_expr[id] {
+fn normalize_math(state: &mut MathState, node: Math) -> Option<Math> {
+    match node {
         Math::Add([a, b]) => {
             let folded = const_at(state, a)? + const_at(state, b)?;
-            Some(state.add(Math::Constant(folded)))
+            Some(Math::Constant(folded))
         }
         Math::Sub([a, b]) => {
             let folded = const_at(state, a)? - const_at(state, b)?;
-            Some(state.add(Math::Constant(folded)))
+            Some(Math::Constant(folded))
         }
         Math::Mul([a, b]) => {
             let folded = const_at(state, a)? * const_at(state, b)?;
-            Some(state.add(Math::Constant(folded)))
+            Some(Math::Constant(folded))
         }
         Math::Div([a, b]) => {
             let denom = const_at(state, b)?;
             if denom == 0.0 {
                 None
             } else {
-                Some(state.add(Math::Constant(const_at(state, a)? / denom)))
+                Some(Math::Constant(const_at(state, a)? / denom))
             }
         }
         Math::Pow([a, b]) => {
@@ -87,59 +87,30 @@ fn fold_math_node(state: &mut MathState, id: Id) -> Option<Id> {
                 .into_inner()
                 .powf(const_at(state, b)?.into_inner());
             let folded = NotNan::new(val).ok()?;
-            Some(state.add(Math::Constant(folded)))
+            Some(Math::Constant(folded))
         }
         Math::Ln(a) => {
             let val = const_at(state, a)?.into_inner().ln();
             let folded = NotNan::new(val).ok()?;
-            Some(state.add(Math::Constant(folded)))
+            Some(Math::Constant(folded))
         }
         Math::Sqrt(a) => {
             let val = const_at(state, a)?.into_inner().sqrt();
             let folded = NotNan::new(val).ok()?;
-            Some(state.add(Math::Constant(folded)))
+            Some(Math::Constant(folded))
         }
         Math::Sin(a) => {
             let val = const_at(state, a)?.into_inner().sin();
             let folded = NotNan::new(val).ok()?;
-            Some(state.add(Math::Constant(folded)))
+            Some(Math::Constant(folded))
         }
         Math::Cos(a) => {
             let val = const_at(state, a)?.into_inner().cos();
             let folded = NotNan::new(val).ok()?;
-            Some(state.add(Math::Constant(folded)))
+            Some(Math::Constant(folded))
         }
         _ => None,
     }
-}
-
-fn normalize_math(state: &mut MathState, root: Id) -> Id {
-    fn rebuild(state: &mut MathState, pos: Id, memo: &mut HashMap<Id, Id>) -> Id {
-        if let Some(&cached) = memo.get(&pos) {
-            return cached;
-        }
-
-        let node = state.rec_expr[pos].clone();
-        let new_children: Vec<Id> = node
-            .children()
-            .iter()
-            .map(|&child| rebuild(state, child, memo))
-            .collect();
-
-        let rebuilt = if node.children() == new_children.as_slice() {
-            pos
-        } else {
-            let mut iter = new_children.into_iter();
-            let new_node = node.map_children(|_| iter.next().unwrap());
-            state.add(new_node)
-        };
-
-        let normalized = fold_math_node(state, rebuilt).unwrap_or(rebuilt);
-        memo.insert(pos, normalized);
-        normalized
-    }
-
-    rebuild(state, root, &mut HashMap::new())
 }
 
 // ─── Rule helpers ─────────────────────────────────────────────────────────────
@@ -277,23 +248,11 @@ fn rules() -> Vec<MathRw> {
 
 // ─── Drivers ─────────────────────────────────────────────────────────────────
 
-/// Run pure greedy descent (temperature = 0) from `start` for up to `n_steps`
-/// steps.  Returns the best expression and its cost found during the run.
-fn greedy_best(start: &str, n_steps: u64) -> (RecExpr<Math>, f64) {
-    let expr: RecExpr<Math> = start.parse().unwrap();
-    let state = MathState::new(expr);
-    let mut runner = MhRunner::new(state, rules()).with_normalizer(normalize_math);
-    let mut rng = SimpleLcg::new(42);
-    runner.run(n_steps, &ConstantBeta(0.0), &mut rng);
-    (runner.best_expr.clone(), runner.best_cost)
-}
-
 fn metropolis_best(start: &str, n_steps: u64, beta: f64, seed: u64) -> (RecExpr<Math>, f64) {
     let expr: RecExpr<Math> = start.parse().unwrap();
-    let state = MathState::new(expr);
-    let mut runner = MhRunner::new(state, rules()).with_normalizer(normalize_math);
+    let mut runner = StoRunner::new(expr, rules()).with_normalizer(normalize_math);
     let mut rng = SimpleLcg::new(seed);
-    runner.run(n_steps, &ConstantBeta(beta), &mut rng);
+    runner.run(n_steps, &PeriodicBeta, &mut rng);
     (runner.best_expr.clone(), runner.best_cost)
 }
 
@@ -346,7 +305,7 @@ fn sto_simplify_add() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best("(+ x (+ x (+ x x)))", 50000, 1.0, 0);
+    let (_, best) = metropolis_best("(+ x (+ x (+ x x)))", 1_000_000, 1.0, 0);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
@@ -499,7 +458,7 @@ fn sto_integ_part2() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best(expr, 100_000, 1.0, 42);
+    let (_, best) = metropolis_best(expr, 1_000_000, 1.0, 42);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
@@ -512,6 +471,6 @@ fn sto_integ_part3() {
         let s = MathState::new(e);
         s.cost[usize::from(s.root())]
     };
-    let (_, best) = metropolis_best(expr, 120_000, 1.0, 42);
+    let (_, best) = metropolis_best(expr, 1_000_000, 1.0, 42);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }

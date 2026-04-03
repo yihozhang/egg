@@ -57,3 +57,7 @@ test-explanations = []
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[profile.profiling]
+inherits = "release"
+debug = true

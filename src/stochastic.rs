@@ -17,7 +17,7 @@
 //!
 //! # Metropolis-Hastings
 //!
-//! [`MhRunner`] implements Metropolis-Hastings over the space of terms.
+//! [`StoRunner`] implements Metropolis-Hastings over the space of terms.
 //! At each step it randomly picks a rule, randomly picks a match, applies the
 //! rewrite (via [`State::transplant`]), and accepts or rejects the result
 //! according to the standard MH criterion using [`StoAnalysis::cost`] and a
@@ -30,6 +30,7 @@
 //! e-graph interface.  The existing [`Subst`] type is reused directly.
 
 use std::fmt::Debug;
+use std::mem;
 use std::sync::Arc;
 use std::{collections::HashMap, fmt::Display};
 
@@ -232,65 +233,63 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
             "child id out of bounds"
         );
 
+        let id = self.rec_expr.add(node);
+        self.touch(id);
+        id
+    }
+
+    /// Recompute analysis data and subtree size for the node at `pos`
+    pub fn touch(&mut self, pos: Id) {
+        let node = &self.rec_expr[pos];
         let data = A::make(&node, &self.analysis);
         let sz = 1 + node.fold(0usize, |acc, child| acc + self.size[usize::from(child)]);
         let c = A::cost(&node, &self.analysis, &self.cost);
 
-        let id = self.rec_expr.add(node);
-        self.analysis.push(data);
-        self.size.push(sz);
-        self.cost.push(c);
-
-        A::modify(self, id);
-        id
+        let pos = usize::from(pos);
+        if self.analysis.len() <= pos {
+            self.analysis.resize(pos + 1, data.clone());
+            self.size.resize(pos + 1, sz);
+            self.cost.resize(pos + 1, c);
+        } else {
+            self.analysis[pos] = data.clone();
+            self.size[pos] = sz;
+            self.cost[pos] = c;
+        }
+        A::modify(self, Id::from(pos));
     }
 
     /// Replace every occurrence of `old_pos` as a subterm root with `new_pos`,
-    /// within the subtree rooted at `root`, appending rebuilt ancestor nodes
-    /// as needed.
-    ///
-    /// Nodes whose subtrees do not contain `old_pos` are reused unchanged.
-    /// Rebuilds are memoized so each position is visited at most once.
-    ///
-    /// Returns the new root of the modified subtree.
-    pub fn transplant(&mut self, root: Id, old_pos: Id, new_pos: Id) -> Id {
-        if root == old_pos {
-            return new_pos;
+    /// within the subtree rooted at `root`.
+    fn transplant(&mut self, pos: &mut Id, old_pos: Id, new_pos: Id) {
+        if old_pos == *pos {
+            *pos = new_pos;
+        } else {
+            self.transplant_inner(*pos, old_pos, new_pos);
+            // self.transplant_inner(new_pos, new_pos, old_pos);
         }
-        let mut memo = HashMap::new();
-        self.do_transplant(root, old_pos, new_pos, &mut memo)
     }
 
-    fn do_transplant(
-        &mut self,
-        pos: Id,
-        old_pos: Id,
-        new_pos: Id,
-        memo: &mut HashMap<Id, Id>,
-    ) -> Id {
-        if pos == old_pos {
-            return new_pos;
-        }
-        if let Some(&cached) = memo.get(&pos) {
-            return cached;
+    fn transplant_inner(&mut self, pos: Id, old_pos: Id, new_pos: Id) -> bool {
+        if pos == new_pos {
+            return false; // Don't recurse into the newly inserted subtree.
         }
         // Clone to release the immutable borrow before any mutable use of self.
-        let node = self.rec_expr[pos].clone();
-        let new_children: Vec<Id> = node
-            .children()
-            .iter()
-            .map(|&child| self.do_transplant(child, old_pos, new_pos, memo))
-            .collect();
+        let mut node = self.rec_expr[pos].clone();
+        let mut updated = false;
+        for child in node.children_mut() {
+            if child == &old_pos {
+                *child = new_pos;
+                updated = true;
+            } else {
+                updated |= self.transplant_inner(*child, old_pos, new_pos);
+            }
+        }
 
-        let result = if node.children() == new_children.as_slice() {
-            pos
-        } else {
-            let mut iter = new_children.into_iter();
-            let new_node = node.map_children(|_| iter.next().unwrap());
-            self.add(new_node)
-        };
-        memo.insert(pos, result);
-        result
+        if updated {
+            self.rec_expr[pos] = node;
+            self.touch(pos);
+        }
+        updated
     }
 
     /// Discard all nodes unreachable from **every** root in `roots`, renumber
@@ -358,13 +357,11 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
 
 /// Return a boolean mask of length `n` where `mask[i]` is `true` iff node `i`
 /// is reachable from at least one node in `roots`.
-///
-/// Callers can pass `n = usize::from(root) + 1` when there is a single root,
-/// since children always have smaller indices in a [`RecExpr`].
 fn reachable_from<L: Language>(rec_expr: &RecExpr<L>, roots: &[Id], n: usize) -> Vec<bool> {
     let mut visited = vec![false; n];
     for &root in roots {
-        let mut stack = vec![usize::from(root)];
+        let mut stack = Vec::with_capacity(n);
+        stack.push(usize::from(root));
         while let Some(i) = stack.pop() {
             if visited[i] {
                 continue;
@@ -410,13 +407,11 @@ pub trait StoSearcher<L: Language, A: StoAnalysis<L>> {
 
     /// Search only the subtree reachable from `root`.
     ///
-    /// Used by [`MhRunner`] so that proposals are confined to the currently
+    /// Used by [`StoRunner`] so that proposals are confined to the currently
     /// accepted expression.  The default does a DFS from `root` and calls
     /// [`search_pos`][Self::search_pos] at each reachable position.
     fn search_rooted(&self, state: &State<L, A>, root: Id) -> Vec<StoSearchMatch> {
-        // Children always have smaller indices than their parent in a RecExpr,
-        // so only indices 0..=root can be in the subtree.
-        let n = usize::from(root) + 1;
+        let n = state.len();
         reachable_from(&state.rec_expr, &[root], n)
             .into_iter()
             .enumerate()
@@ -596,16 +591,16 @@ pub trait BetaSchedule {
 /// the root of the normalized expression.
 pub trait StoNormalizer<L: Language, A: StoAnalysis<L>> {
     /// Normalize the expression rooted at `root` and return the new root.
-    fn normalize(&self, state: &mut State<L, A>, root: Id) -> Id;
+    fn normalize(&self, state: &mut State<L, A>, node: L) -> Option<L>;
 }
 
 impl<L, A, F> StoNormalizer<L, A> for F
 where
     L: Language,
     A: StoAnalysis<L>,
-    F: Fn(&mut State<L, A>, Id) -> Id,
+    F: Fn(&mut State<L, A>, L) -> Option<L> + Send + Sync + 'static,
 {
-    fn normalize(&self, state: &mut State<L, A>, root: Id) -> Id {
+    fn normalize(&self, state: &mut State<L, A>, root: L) -> Option<L> {
         self(state, root)
     }
 }
@@ -613,8 +608,16 @@ where
 struct NoopNormalizer;
 
 impl<L: Language, A: StoAnalysis<L>> StoNormalizer<L, A> for NoopNormalizer {
-    fn normalize(&self, _state: &mut State<L, A>, root: Id) -> Id {
-        root
+    fn normalize(&self, _state: &mut State<L, A>, root: L) -> Option<L> {
+        None
+    }
+}
+
+impl<L: Language, A: StoAnalysis<L>> StoNormalizer<L, A>
+    for Arc<dyn StoNormalizer<L, A> + Send + Sync>
+{
+    fn normalize(&self, state: &mut State<L, A>, node: L) -> Option<L> {
+        (**self).normalize(state, node)
     }
 }
 
@@ -642,7 +645,15 @@ impl BetaSchedule for GeometricBeta {
     }
 }
 
-// ─── MhRunner ────────────────────────────────────────────────────────────────
+pub struct PeriodicBeta;
+
+impl BetaSchedule for PeriodicBeta {
+    fn beta(&self, step: u64) -> f64 {
+        if step % 1000 < 3 { 0.0 } else { 3.0 }
+    }
+}
+
+// ─── StoRunner ────────────────────────────────────────────────────────────────
 
 /// The result of a single Metropolis-Hastings step.
 #[derive(Debug, Clone)]
@@ -662,31 +673,34 @@ pub struct MhStepResult {
 ///   It is copied out of the state whenever a new best is found, so compaction
 ///   of `state` only needs to preserve `current_root`.
 ///
-/// At each step ([`MhRunner::step`]) all matches from every rule are collected
+/// At each step ([`StoRunner::step`]) all matches from every rule are collected
 /// and scored via an exponential race that prefers lower-cost proposals while
 /// still allowing uphill moves when beta is positive.
 ///
 /// Node costs are read directly from [`State::cost`] — O(1) per step.
-pub struct MhRunner<L: Language, A: StoAnalysis<L>> {
+pub struct StoRunner<L: Language, A: StoAnalysis<L>> {
     /// The backing state (accumulates all generated nodes until compaction).
     pub state: State<L, A>,
     /// Root of the currently accepted expression within `state`.
     pub current_root: Id,
     /// Cost of the currently accepted expression (`state.cost[current_root]`).
     pub current_cost: f64,
+    /// initial expression
+    pub initial_expr: RecExpr<L>,
     /// Snapshot of the lowest-cost expression seen so far.
     pub best_expr: RecExpr<L>,
     /// Cost of the best expression seen so far.
     pub best_cost: f64,
-    /// Number of [`step`][MhRunner::step] calls made so far.
+    /// Number of [`step`][StoRunner::step] calls made so far.
     pub step_count: u64,
     rules: Vec<StoRewrite<L, A>>,
     normalizer: Arc<dyn StoNormalizer<L, A> + Send + Sync>,
 }
 
-impl<L: Language + Display, A: StoAnalysis<L>> MhRunner<L, A> {
-    /// Create a new [`MhRunner`] from an initial state and rules.
-    pub fn new(state: State<L, A>, rules: Vec<StoRewrite<L, A>>) -> Self {
+impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
+    /// Create a new [`StoRunner`] from an initial state and rules.
+    pub fn new(initial_expr: RecExpr<L>, rules: Vec<StoRewrite<L, A>>) -> Self {
+        let state = State::new(initial_expr.clone());
         let current_root = state.root();
         let current_cost = state.cost[usize::from(current_root)];
         let best_expr = state.rec_expr.extract(current_root);
@@ -694,6 +708,7 @@ impl<L: Language + Display, A: StoAnalysis<L>> MhRunner<L, A> {
             state,
             current_root,
             current_cost,
+            initial_expr,
             best_expr,
             best_cost: current_cost,
             step_count: 0,
@@ -714,19 +729,45 @@ impl<L: Language + Display, A: StoAnalysis<L>> MhRunner<L, A> {
         self
     }
 
+    /// Normalize the subtree rooted at `pos` in-place, updating analysis and
+    /// cost for every touched node.
+    pub fn normalize(&mut self, pos: Id) {
+        let mut normalizer = Arc::clone(&self.normalizer);
+        if Self::normalize_inner(&mut self.state, &mut normalizer, pos) {
+            self.state.touch(pos);
+        }
+    }
+
+    fn normalize_inner(
+        state: &mut State<L, A>,
+        normalizer: &mut (impl StoNormalizer<L, A> + Send + Sync),
+        pos: Id,
+    ) -> bool {
+        // eprintln!(
+        //     "Normalizing at pos {}: {:?} (size: {})",
+        //     pos,
+        //     state.rec_expr[pos],
+        //     state.size[usize::from(pos)]
+        // );
+        let node = state.rec_expr[pos].clone();
+        let mut updated = false;
+        for i in node.children() {
+            updated |= Self::normalize_inner(state, normalizer, *i);
+        }
+
+        if let Some(folded) = normalizer.normalize(state, node) {
+            state.rec_expr[pos] = folded;
+            updated = true;
+        }
+
+        if updated {
+            state.touch(pos);
+        }
+
+        updated
+    }
+
     /// Perform one Metropolis-Hastings step.
-    ///
-    /// 1. Initialize a race with the current expression as incumbent.
-    /// 2. Enumerate every rewrite match in the subtree rooted at `current_root`.
-    /// 3. Build each proposal and compute its cost.
-    /// 4. Draw an exponential nonce and scale it by the proposal's inverse
-    ///    weight, where worse costs are penalized by temperature.
-    /// 5. Keep the proposal with the smallest scaled nonce.
-    /// 6. Move to that winner, update best-so-far, and compact if beneficial.
-    ///
-    /// Returns `None` if there are no rules; otherwise always returns
-    /// `Some(MhStepResult)` — with `accepted = false` when no match was found
-    /// or the proposal was rejected.
     pub fn step<T: BetaSchedule>(&mut self, schedule: &T, rng: &mut impl StoRng) -> MhStepResult {
         assert!(!self.rules.is_empty());
 
@@ -742,52 +783,50 @@ impl<L: Language + Display, A: StoAnalysis<L>> MhRunner<L, A> {
         // Incumbent starts as the current state.
         // sample_exp1();
         let mut selected_nonce = sample_exp1();
-        let mut selected_root = self.current_root;
         let mut selected_cost = self.current_cost;
+        let mut winner: Option<(Id, Id)> = None; // (old_subterm_pos, new_subterm)
 
         // Enumerate all proposals without storing them: maintain only the
         // current race winner.
-        for rule in &self.rules {
+        let rules = mem::take(&mut self.rules);
+        for rule in &rules {
             for m in rule.searcher.search_rooted(&self.state, self.current_root) {
                 let Some(new_subterm) = rule.applier.apply_one(&mut self.state, m.pos, &m.substs)
                 else {
                     continue;
                 };
+                self.normalize(new_subterm);
 
-                let proposed_root = self.state.transplant(self.current_root, m.pos, new_subterm);
-                let proposed_root = self.normalizer.normalize(&mut self.state, proposed_root);
-                let proposed_cost = self.state.cost[usize::from(proposed_root)];
+                let current_subterm_cost = self.state.cost[usize::from(m.pos)];
+                let proposed_subterm_cost = self.state.cost[usize::from(new_subterm)];
 
-                let weight = -beta * (proposed_cost - self.current_cost);
+                let weight = -beta * (proposed_subterm_cost - current_subterm_cost);
                 let nonce = weight + sample_exp1();
-                // println!(
-                //     "Rule `{}`: proposed term {} with weight {}, nonce {}",
-                //     rule.name,
-                //     self.state.rec_expr.extract(proposed_root).pretty(80),
-                //     weight,
-                //     nonce
-                // );
                 if nonce > selected_nonce {
                     selected_nonce = nonce;
-                    selected_root = proposed_root;
-                    selected_cost = proposed_cost;
+                    winner = Some((m.pos, new_subterm));
                 }
             }
         }
+        self.rules = rules;
 
-        // println!("{}", self.state.rec_expr.extract(selected_root).pretty(80));
+        // Apply the winning proposal exactly once, after selection is complete.
+        if let Some((old_pos, new_subterm)) = winner {
+            self.state
+                .transplant(&mut self.current_root, old_pos, new_subterm);
+            self.normalize(self.current_root);
+            selected_cost = self.state.cost[usize::from(self.current_root)];
+        }
 
-        let accepted = selected_root != self.current_root;
-
+        let accepted = selected_cost < self.current_cost;
         if accepted {
-            self.current_root = selected_root;
             self.current_cost = selected_cost;
 
             // ── 6. Snapshot best ─────────────────────────────────────────────
             // Copy the expression out of the state so compaction only needs to
             // track current_root — no multi-root bookkeeping required.
             if selected_cost < self.best_cost {
-                self.best_expr = self.state.rec_expr.extract(selected_root);
+                self.best_expr = self.state.rec_expr.extract(self.current_root);
                 self.best_cost = selected_cost;
             }
         }
@@ -808,17 +847,20 @@ impl<L: Language + Display, A: StoAnalysis<L>> MhRunner<L, A> {
     ///
     /// Returns early if there are no rules.
     pub fn run<T: BetaSchedule>(&mut self, n_steps: u64, schedule: &T, rng: &mut impl StoRng) {
-        for i in 0..n_steps {
-            // if i % 1000 == 0 {
-            //     eprintln!(
-            //         "Step {}: current cost = {}, best cost = {}, state size = {}",
-            //         i,
-            //         self.current_cost,
-            //         self.best_cost,
-            //         self.state.len()
-            //     );
-            // }
-            self.step(schedule, rng);
+        let mut stall = 0;
+        for _ in 0..n_steps {
+            let result = self.step(schedule, rng);
+            if result.accepted {
+                stall = 0;
+            } else {
+                stall += 1;
+            }
+            if stall >= 10000 {
+                self.state = State::new(self.initial_expr.clone());
+                self.current_root = self.state.root();
+                self.current_cost = self.state.cost[usize::from(self.current_root)];
+                stall = 0;
+            }
         }
     }
 
