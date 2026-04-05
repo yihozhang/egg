@@ -482,7 +482,7 @@ impl<L: Language> RecExpr<L> {
         self
     }
 
-    pub(crate) fn extract(&self, new_root: Id) -> Self {
+    pub fn extract(&self, new_root: Id) -> Self {
         self[new_root].build_recexpr(|id| self[id].clone())
     }
 

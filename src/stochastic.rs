@@ -32,7 +32,10 @@
 use std::fmt::Debug;
 use std::mem;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, fmt::Display};
+
+use smallvec::SmallVec;
 
 use crate::{Id, Language, RecExpr, Subst, Symbol, Var};
 
@@ -63,7 +66,7 @@ use crate::{Id, Language, RecExpr, Subst, Symbol, Var};
 ///     }
 /// }
 /// ```
-pub trait StoAnalysis<L: Language>: Sized {
+pub trait StoAnalysis<L: Language>: Sized + Default {
     /// The per-node data produced by this analysis.
     type Data: Debug + Clone;
 
@@ -72,7 +75,7 @@ pub trait StoAnalysis<L: Language>: Sized {
     /// `analysis` holds the data for all nodes already in the state
     /// (indices `0..current`).  Every child [`Id`] of `enode` is a valid
     /// index into `analysis`.
-    fn make(enode: &L, analysis: &[Self::Data]) -> Self::Data;
+    fn make(&self, enode: &L, analysis: &[Self::Data]) -> Self::Data;
 
     /// Compute the cost of the node at the current insertion point.
     ///
@@ -82,7 +85,7 @@ pub trait StoAnalysis<L: Language>: Sized {
     ///
     /// The default implementation returns AST node count (1 + sum of children
     /// costs), matching [`egg::AstSize`][crate::AstSize].
-    fn cost(enode: &L, _analysis: &[Self::Data], children_cost: &[f64]) -> f64 {
+    fn cost(&self, enode: &L, _analysis: &[Self::Data], children_cost: &[f64]) -> f64 {
         1.0 + enode.fold(0.0, |acc, child| acc + children_cost[usize::from(child)])
     }
 
@@ -91,7 +94,7 @@ pub trait StoAnalysis<L: Language>: Sized {
     /// Can be used to trigger derived insertions (e.g., constant folding).
     /// The default does nothing.
     #[allow(unused_variables)]
-    fn modify(state: &mut State<L, Self>, pos: Id) {}
+    fn modify(&self, state: &mut State<L, Self>, pos: Id) {}
 
     /// Remap any [`Id`]s stored inside `data` after a compaction.
     ///
@@ -99,13 +102,13 @@ pub trait StoAnalysis<L: Language>: Sized {
     /// before compaction.  Called for every surviving node's data entry.
     /// The default is a no-op (suitable when `Data` contains no `Id`s).
     #[allow(unused_variables)]
-    fn remap_data(data: &mut Self::Data, remap: &[u32]) {}
+    fn remap_data(&self, data: &mut Self::Data, remap: &[u32]) {}
 }
 
 /// No-op analysis; stores `()` for every node.
 impl<L: Language> StoAnalysis<L> for () {
     type Data = ();
-    fn make(_enode: &L, _analysis: &[()]) {}
+    fn make(&self, _enode: &L, _analysis: &[()]) {}
 }
 
 // ─── State ───────────────────────────────────────────────────────────────────
@@ -122,8 +125,11 @@ impl<L: Language> StoAnalysis<L> for () {
 /// - `rec_expr.len() == analysis.len() == size.len() == cost.len()`
 /// - For every node at index `i`, all child [`Id`]s satisfy `child < i`.
 /// - `size[i]` equals the number of nodes in the subtree rooted at `i`.
-/// - `cost[i]` equals [`A::cost`][StoAnalysis::cost] evaluated at `i`.
+/// - `cost[i]` equals the effective cost function evaluated at `i` (either
+///   the override installed via [`State::set_cost_override`] or
+///   [`A::cost`][StoAnalysis::cost]).
 pub struct State<L: Language, A: StoAnalysis<L>> {
+    pub sto_analysis: A,
     /// The expression as a flat list; the root is the last element.
     pub rec_expr: RecExpr<L>,
     /// Per-node analysis data; `analysis[i]` corresponds to `rec_expr[i]`.
@@ -131,8 +137,14 @@ pub struct State<L: Language, A: StoAnalysis<L>> {
     /// Per-node subtree sizes; `size[i]` is the number of nodes reachable
     /// from position `i` (counting `i` itself).
     pub size: Vec<usize>,
-    /// Per-node costs; `cost[i]` is [`A::cost`][StoAnalysis::cost] for node `i`.
+    /// Per-node costs; `cost[i]` is the effective cost function for node `i`.
     pub cost: Vec<f64>,
+    /// Optional cost function that overrides [`StoAnalysis::cost`].
+    ///
+    /// When set (via [`State::set_cost_override`]), this function is used
+    /// instead of `A::cost` whenever a node's cost is (re)computed.  All
+    /// existing costs are rebuilt immediately on installation or removal.
+    pub cost_override: Option<Arc<dyn Fn(&L, &[A::Data], &[f64]) -> f64 + Send + Sync>>,
 }
 
 impl<L: Language, A: StoAnalysis<L>> State<L, A> {
@@ -142,31 +154,40 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
     /// [`A::modify`][StoAnalysis::modify] is called for each node after the
     /// initial pass, in index order.
     pub fn new(rec_expr: RecExpr<L>) -> Self {
+        Self::new_with_analysis(rec_expr, A::default())
+    }
+
+    /// Variant of `new` that takes a pre-constructed `sto_analysis` instance.
+    pub fn new_with_analysis(rec_expr: RecExpr<L>, sto_analysis: A) -> Self {
         let n = rec_expr.as_ref().len();
         let mut analysis: Vec<A::Data> = Vec::with_capacity(n);
         let mut size: Vec<usize> = Vec::with_capacity(n);
         let mut cost: Vec<f64> = Vec::with_capacity(n);
 
         for node in rec_expr.as_ref().iter() {
-            let data = A::make(node, &analysis);
+            let data = sto_analysis.make(node, &analysis);
             let sz = 1 + node.fold(0usize, |acc, child| acc + size[usize::from(child)]);
-            let c = A::cost(node, &analysis, &cost);
+            let c = sto_analysis.cost(node, &analysis, &cost);
             analysis.push(data);
             size.push(sz);
             cost.push(c);
         }
 
         let mut state = Self {
+            sto_analysis,
             rec_expr,
             analysis,
             size,
             cost,
+            cost_override: None,
         };
 
         // Run modify hooks for the initial nodes (new nodes added inside
         // modify will have their own hooks triggered via State::add).
         for i in 0..n {
-            A::modify(&mut state, Id::from(i));
+            let a = mem::take(&mut state.sto_analysis);
+            a.modify(&mut state, Id::from(i));
+            state.sto_analysis = a;
         }
 
         state
@@ -184,22 +205,6 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
         self.rec_expr.as_ref().is_empty()
     }
 
-    /// The [`Id`] of the root node (the last element of `rec_expr`).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the state is empty.
-    #[inline]
-    pub fn root(&self) -> Id {
-        self.rec_expr.root()
-    }
-
-    /// The subtree size of the current root node.
-    #[inline]
-    pub fn root_size(&self) -> usize {
-        self.size[usize::from(self.root())]
-    }
-
     /// Returns `true` when compaction relative to `root` would recover
     /// meaningful memory.
     ///
@@ -208,12 +213,6 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
     #[inline]
     pub fn should_compact_from(&self, root: Id) -> bool {
         self.len() > std::cmp::max(4 * self.size[usize::from(root)], 100)
-    }
-
-    /// Convenience wrapper — equivalent to `should_compact_from(self.root())`.
-    #[inline]
-    pub fn should_compact(&self) -> bool {
-        self.should_compact_from(self.root())
     }
 
     /// Append a new node to the state, computing its analysis data and subtree
@@ -240,10 +239,13 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
 
     /// Recompute analysis data and subtree size for the node at `pos`
     pub fn touch(&mut self, pos: Id) {
-        let node = &self.rec_expr[pos];
-        let data = A::make(&node, &self.analysis);
+        let node = self.rec_expr[pos].clone();
+        let data = self.sto_analysis.make(&node, &self.analysis);
         let sz = 1 + node.fold(0usize, |acc, child| acc + self.size[usize::from(child)]);
-        let c = A::cost(&node, &self.analysis, &self.cost);
+        let c = match &self.cost_override {
+            Some(f) => f(&node, &self.analysis, &self.cost),
+            None => self.sto_analysis.cost(&node, &self.analysis, &self.cost),
+        };
 
         let pos = usize::from(pos);
         if self.analysis.len() <= pos {
@@ -255,7 +257,42 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
             self.size[pos] = sz;
             self.cost[pos] = c;
         }
-        A::modify(self, Id::from(pos));
+        let a = mem::take(&mut self.sto_analysis);
+        a.modify(self, Id::from(pos));
+        self.sto_analysis = a;
+    }
+
+    /// Install a cost function override and rebuild all node costs.
+    ///
+    /// Until [`State::clear_cost_override`] is called, every future
+    /// [`State::touch`] / [`State::add`] will use `f` instead of
+    /// [`StoAnalysis::cost`].  All existing `cost` entries are recomputed
+    /// immediately using the new function.
+    pub fn set_cost_override(
+        &mut self,
+        f: Arc<dyn Fn(&L, &[A::Data], &[f64]) -> f64 + Send + Sync>,
+    ) {
+        self.cost_override = Some(f);
+        self.rebuild_costs();
+    }
+
+    /// Remove the cost function override and rebuild all node costs using
+    /// [`StoAnalysis::cost`].
+    pub fn clear_cost_override(&mut self) {
+        self.cost_override = None;
+        self.rebuild_costs();
+    }
+
+    /// Recompute every entry in `cost` using the current effective cost
+    /// function (the override if set, otherwise [`StoAnalysis::cost`]).
+    pub fn rebuild_costs(&mut self) {
+        for i in 0..self.len() {
+            let node = self.rec_expr[Id::from(i)].clone();
+            self.cost[i] = match &self.cost_override {
+                Some(f) => f(&node, &self.analysis, &self.cost),
+                None => self.sto_analysis.cost(&node, &self.analysis, &self.cost),
+            };
+        }
     }
 
     /// Replace every occurrence of `old_pos` as a subterm root with `new_pos`,
@@ -327,7 +364,7 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
                 .map_children(|child| Id::from(remap[usize::from(child)] as usize));
             new_nodes.push(node);
             let mut data = self.analysis[old_idx].clone();
-            A::remap_data(&mut data, &remap);
+            self.sto_analysis.remap_data(&mut data, &remap);
             new_analysis.push(data);
             new_size.push(self.size[old_idx]);
             new_cost.push(self.cost[old_idx]);
@@ -339,14 +376,6 @@ impl<L: Language, A: StoAnalysis<L>> State<L, A> {
         self.cost = new_cost;
 
         Id::from(remap[usize::from(root)] as usize)
-    }
-
-    /// Compact the state keeping only nodes reachable from `self.root()`.
-    ///
-    /// See [`compact_keeping`][State::compact_keeping] for the general form.
-    pub fn compact(&mut self) {
-        let root = self.root();
-        self.compact_keeping(root);
     }
 }
 
@@ -416,9 +445,10 @@ pub trait StoSearcher<L: Language, A: StoAnalysis<L>> {
 pub trait StoApplier<L: Language, A: StoAnalysis<L>> {
     /// Apply one substitution found at `pos`, extending `state` with new nodes.
     ///
-    /// Returns the [`Id`] of the newly created replacement root, or `None` to
-    /// skip this match.
-    fn apply_one(&self, state: &mut State<L, A>, pos: Id, subst: &Subst) -> Option<Id>;
+    /// Returns the [`Id`]s of newly created replacement roots.  An empty vec
+    /// means the match is skipped; multiple entries mean the applier proposes
+    /// several alternatives for this match.
+    fn apply_one(&self, state: &mut State<L, A>, pos: Id, subst: &Subst) -> SmallVec<[Id; 4]>;
 
     /// Return every [`Var`] this applier requires to be bound by the searcher.
     fn vars(&self) -> Vec<Var> {
@@ -444,11 +474,11 @@ pub struct StoConditionalApplier<L: Language, A: StoAnalysis<L>> {
 }
 
 impl<L: Language, A: StoAnalysis<L>> StoApplier<L, A> for StoConditionalApplier<L, A> {
-    fn apply_one(&self, state: &mut State<L, A>, pos: Id, subst: &Subst) -> Option<Id> {
+    fn apply_one(&self, state: &mut State<L, A>, pos: Id, subst: &Subst) -> SmallVec<[Id; 4]> {
         if (self.condition)(state, pos, subst) {
             self.applier.apply_one(state, pos, subst)
         } else {
-            None
+            SmallVec::new()
         }
     }
 
@@ -571,24 +601,24 @@ pub trait BetaSchedule {
 /// the root of the normalized expression.
 pub trait StoNormalizer<L: Language, A: StoAnalysis<L>> {
     /// Normalize the expression rooted at `root` and return the new root.
-    fn normalize(&self, state: &mut State<L, A>, node: L) -> Option<L>;
+    fn normalize(&self, state: &mut State<L, A>, id: Id, root: L) -> Option<L>;
 }
 
 impl<L, A, F> StoNormalizer<L, A> for F
 where
     L: Language,
     A: StoAnalysis<L>,
-    F: Fn(&mut State<L, A>, L) -> Option<L> + Send + Sync + 'static,
+    F: Fn(&mut State<L, A>, Id, L) -> Option<L> + Send + Sync + 'static,
 {
-    fn normalize(&self, state: &mut State<L, A>, root: L) -> Option<L> {
-        self(state, root)
+    fn normalize(&self, state: &mut State<L, A>, id: Id, root: L) -> Option<L> {
+        self(state, id, root)
     }
 }
 
 struct NoopNormalizer;
 
 impl<L: Language, A: StoAnalysis<L>> StoNormalizer<L, A> for NoopNormalizer {
-    fn normalize(&self, _state: &mut State<L, A>, root: L) -> Option<L> {
+    fn normalize(&self, _state: &mut State<L, A>, _id: Id, _root: L) -> Option<L> {
         None
     }
 }
@@ -596,8 +626,8 @@ impl<L: Language, A: StoAnalysis<L>> StoNormalizer<L, A> for NoopNormalizer {
 impl<L: Language, A: StoAnalysis<L>> StoNormalizer<L, A>
     for Arc<dyn StoNormalizer<L, A> + Send + Sync>
 {
-    fn normalize(&self, state: &mut State<L, A>, node: L) -> Option<L> {
-        (**self).normalize(state, node)
+    fn normalize(&self, state: &mut State<L, A>, id: Id, root: L) -> Option<L> {
+        (**self).normalize(state, id, root)
     }
 }
 
@@ -625,11 +655,19 @@ impl BetaSchedule for GeometricBeta {
     }
 }
 
-pub struct PeriodicBeta;
+pub struct PeriodicBeta {
+    pub interval: u64,
+    pub random_walk_steps: u64,
+    pub beta: f64,
+}
 
 impl BetaSchedule for PeriodicBeta {
     fn beta(&self, step: u64) -> f64 {
-        if step % 1000 < 3 { 0.0 } else { 3.0 }
+        if step % self.interval < self.random_walk_steps {
+            0.0
+        } else {
+            self.beta
+        }
     }
 }
 
@@ -646,6 +684,9 @@ pub struct StoConfig {
     /// Maximum total iterations.
     /// Default: [`usize::MAX`] (run indefinitely).
     pub max_iter: usize,
+    /// Maximum wall-clock time before stopping.
+    /// Default: [`Duration::MAX`] (no time limit).
+    pub max_time: Duration,
     /// Beta schedule for Metropolis-Hastings acceptance.
     /// Default: constant beta of 1.0.
     pub beta_schedule: Box<dyn BetaSchedule>,
@@ -657,9 +698,62 @@ impl Default for StoConfig {
             max_stall: usize::MAX,
             max_restart: usize::MAX,
             max_iter: usize::MAX,
+            max_time: Duration::MAX,
             beta_schedule: Box::new(ConstantBeta(1.0)),
         }
     }
+}
+
+// ─── StoPhase ────────────────────────────────────────────────────────────────
+
+/// Configuration for one phase of a multi-phase [`StoRunner::run_phased`] run.
+///
+/// Phases are executed in order within each run (initial start or restart).
+/// A phase ends when it exhausts `max_iter` **or** stalls for `max_stall`
+/// consecutive non-improving steps.  When the last phase ends, a restart is
+/// triggered (resetting to the initial expression and cycling back to phase 0),
+/// unless `max_restart` has been reached.
+///
+/// # Cost override
+///
+/// Setting `cost_fn` replaces [`StoAnalysis::cost`] for the duration of this
+/// phase.  On phase entry the state's entire `cost` vector is rebuilt with the
+/// new function; on phase exit it is rebuilt again with the next phase's
+/// function (or the analysis's own cost if the next phase has no override).
+/// This makes it straightforward to use, e.g., pure AST size during a warm-up
+/// phase and a richer domain cost afterward, without duplicating analysis logic.
+///
+/// # Example — two-phase warm-up
+///
+/// ```rust,ignore
+/// let ast_size: Arc<dyn Fn(&L, &[A::Data], &[f64]) -> f64 + Send + Sync> =
+///     Arc::new(|enode, _data, cc| 1.0 + enode.fold(0.0, |s, c| s + cc[usize::from(c)]));
+///
+/// let phases = vec![
+///     StoPhase { max_iter: 500, max_stall: usize::MAX, beta_schedule: Box::new(PeriodicBeta { .. }),
+///                record_best: false, cost_fn: Some(Arc::clone(&ast_size)) },
+///     StoPhase { max_iter: usize::MAX, max_stall: 10_000, beta_schedule: Box::new(PeriodicBeta { .. }),
+///                record_best: true, cost_fn: None },
+/// ];
+/// runner.run_phased(&phases, max_restart, timeout, &mut rng);
+/// ```
+pub struct StoPhase<L: Language, A: StoAnalysis<L>> {
+    /// Maximum iterations in this phase before advancing to the next.
+    pub max_iter: usize,
+    /// Advance to the next phase (or restart) after this many consecutive
+    /// non-improving iterations.
+    pub max_stall: usize,
+    /// Beta schedule for Metropolis-Hastings acceptance in this phase.
+    pub beta_schedule: Box<dyn BetaSchedule>,
+    /// Whether to update `best_expr` / `best_cost` during this phase.
+    ///
+    /// Set to `false` for warm-up phases whose cost metric differs from the
+    /// final objective.
+    pub record_best: bool,
+    /// Optional cost function override for this phase.
+    ///
+    /// `None` means "use [`StoAnalysis::cost`] as usual."
+    pub cost_fn: Option<Arc<dyn Fn(&L, &[A::Data], &[f64]) -> f64 + Send + Sync>>,
 }
 
 // ─── StoRunner ────────────────────────────────────────────────────────────────
@@ -706,15 +800,31 @@ pub struct StoRunner<L: Language, A: StoAnalysis<L>> {
     pub n_proposed: u64,
     /// Total number of proposals accepted across all steps (for logging / diagnostics).
     pub n_accepted: u64,
+    /// Whether [`step`][StoRunner::step] should update `best_expr`/`best_cost`.
+    ///
+    /// Toggled by [`StoRunner::run_phased`] between phases.  Defaults to `true`.
+    /// You may also set it directly when driving the runner step-by-step.
+    pub record_best: bool,
     rules: Vec<StoRewrite<L, A>>,
     normalizer: Arc<dyn StoNormalizer<L, A> + Send + Sync>,
+    /// Optional hook called at the start of each iteration in [`StoRunner::run`].
+    iter_hook: Option<Box<dyn FnMut(&mut Self)>>,
 }
 
 impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
     /// Create a new [`StoRunner`] from an initial state and rules.
     pub fn new(initial_expr: RecExpr<L>, rules: Vec<StoRewrite<L, A>>) -> Self {
-        let state = State::new(initial_expr.clone());
-        let current_root = state.root();
+        Self::new_with_analysis(initial_expr, rules, A::default())
+    }
+
+    /// Variant of `new` that takes a pre-constructed `sto_analysis` instance.
+    pub fn new_with_analysis(
+        initial_expr: RecExpr<L>,
+        rules: Vec<StoRewrite<L, A>>,
+        sto_analysis: A,
+    ) -> Self {
+        let state = State::new_with_analysis(initial_expr.clone(), sto_analysis);
+        let current_root = state.rec_expr.root();
         let current_cost = state.cost[usize::from(current_root)];
         let best_expr = state.rec_expr.extract(current_root);
         Self {
@@ -727,9 +837,17 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
             step_count: 0,
             n_proposed: 0,
             n_accepted: 0,
+            record_best: true,
             rules,
             normalizer: Arc::new(NoopNormalizer),
+            iter_hook: None,
         }
+    }
+
+    /// Set a per-iteration hook called at the start of each iteration in [`StoRunner::run`].
+    pub fn with_iter_hook(mut self, hook: impl FnMut(&mut Self) + 'static) -> Self {
+        self.iter_hook = Some(Box::new(hook));
+        self
     }
 
     /// Set a post-rewrite normalizer invoked on every proposed expression.
@@ -770,7 +888,7 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
             updated |= Self::normalize_inner(state, normalizer, *i);
         }
 
-        if let Some(folded) = normalizer.normalize(state, node) {
+        if let Some(folded) = normalizer.normalize(state, pos, node) {
             state.rec_expr[pos] = folded;
             updated = true;
         }
@@ -783,7 +901,11 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
     }
 
     /// Perform one Metropolis-Hastings step.
-    pub fn step<T: BetaSchedule + ?Sized>(&mut self, schedule: &T, rng: &mut impl StoRng) -> MhStepResult {
+    pub fn step<T: BetaSchedule + ?Sized>(
+        &mut self,
+        schedule: &T,
+        rng: &mut impl StoRng,
+    ) -> MhStepResult {
         assert!(!self.rules.is_empty());
 
         let beta = schedule.beta(self.step_count);
@@ -797,7 +919,8 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
 
         // Incumbent starts as the current state.
         // sample_exp1();
-        let mut selected_nonce = sample_exp1();
+        // let mut selected_nonce = sample_exp1();
+        let mut selected_nonce = 0.0;
         let mut selected_cost = self.current_cost;
         let mut winner: Option<(Id, Id)> = None; // (old_subterm_pos, new_subterm)
 
@@ -821,21 +944,19 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
         let rules = mem::take(&mut self.rules);
         for rule in &rules {
             for m in search_rooted(&self.state, &rule.searcher) {
-                let Some(new_subterm) = rule.applier.apply_one(&mut self.state, m.pos, &m.substs)
-                else {
-                    continue;
-                };
-                self.n_proposed += 1;
-                self.normalize(new_subterm);
+                for new_subterm in rule.applier.apply_one(&mut self.state, m.pos, &m.substs) {
+                    self.n_proposed += 1;
+                    self.normalize(new_subterm);
 
-                let current_subterm_cost = self.state.cost[usize::from(m.pos)];
-                let proposed_subterm_cost = self.state.cost[usize::from(new_subterm)];
+                    let current_subterm_cost = self.state.cost[usize::from(m.pos)];
+                    let proposed_subterm_cost = self.state.cost[usize::from(new_subterm)];
 
-                let weight = -beta * (proposed_subterm_cost - current_subterm_cost);
-                let nonce = weight + sample_exp1();
-                if nonce > selected_nonce {
-                    selected_nonce = nonce;
-                    winner = Some((m.pos, new_subterm));
+                    let weight = -beta * (proposed_subterm_cost - current_subterm_cost);
+                    let nonce = weight + sample_exp1();
+                    if nonce > selected_nonce {
+                        selected_nonce = nonce;
+                        winner = Some((m.pos, new_subterm));
+                    }
                 }
             }
         }
@@ -854,7 +975,7 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
         if improved {
             self.current_cost = selected_cost;
 
-            if selected_cost < self.best_cost {
+            if self.record_best && selected_cost < self.best_cost {
                 self.best_expr = self.state.rec_expr.extract(self.current_root);
                 self.best_cost = selected_cost;
             }
@@ -874,26 +995,125 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
 
     /// Run the MH chain according to the given [`StoConfig`].
     ///
-    /// Stops when `max_iter` iterations have been run, when `max_restart`
-    /// restarts have occurred, or when `max_stall` consecutive non-improving
-    /// iterations are reached and no further restarts are allowed.
+    /// Stops when `max_iter` iterations have been run, `max_time` has elapsed,
+    /// `max_restart` restarts have occurred, or when `max_stall` consecutive
+    /// non-improving iterations are reached and no further restarts are allowed.
     pub fn run(&mut self, config: StoConfig, rng: &mut impl StoRng) {
+        let start = Instant::now();
         let mut stall = 0usize;
         let mut restarts = 0usize;
         for _ in 0..config.max_iter {
+            if start.elapsed() >= config.max_time {
+                break;
+            }
+            if let Some(mut hook) = self.iter_hook.take() {
+                hook(self);
+                self.iter_hook = Some(hook);
+            }
             let result = self.step(config.beta_schedule.as_ref(), rng);
             stall += !result.improved as usize;
             if stall >= config.max_stall {
                 if restarts >= config.max_restart {
                     break;
                 }
-                self.state = State::new(self.initial_expr.clone());
-                self.current_root = self.state.root();
+                let state = State::new_with_analysis(
+                    self.initial_expr.clone(),
+                    mem::take(&mut self.state.sto_analysis),
+                );
+                self.state = state;
+                self.current_root = self.state.rec_expr.root();
                 self.current_cost = self.state.cost[usize::from(self.current_root)];
                 stall = 0;
                 restarts += 1;
             }
         }
+        println!(
+            "MH finished: best cost = {}, # proposed = {}, # accepted = {}",
+            self.best_cost, self.n_proposed, self.n_accepted,
+        );
+    }
+
+    /// Run a multi-phase MH chain.
+    ///
+    /// `phases` are executed in order within each run (initial start or any
+    /// restart).  A phase ends when it exhausts its `max_iter` budget **or**
+    /// accumulates `max_stall` consecutive non-improving steps.  After the
+    /// last phase ends, a restart is triggered unless `max_restart` restarts
+    /// have already occurred.  The overall run stops when either `max_restart`
+    /// is exhausted or `max_time` elapses.
+    ///
+    /// On each phase transition the state's cost vector is rebuilt using the
+    /// incoming phase's `cost_fn` (or [`StoAnalysis::cost`] if `None`), and
+    /// `current_cost` is updated accordingly.  `record_best` on the runner is
+    /// set to the incoming phase's value before any step is taken.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `phases` is empty.
+    pub fn run_phased(
+        &mut self,
+        phases: &[StoPhase<L, A>],
+        max_restart: usize,
+        max_time: Duration,
+        rng: &mut impl StoRng,
+    ) {
+        assert!(!phases.is_empty(), "run_phased requires at least one phase");
+        let start = Instant::now();
+        let mut restarts = 0usize;
+
+        'outer: loop {
+            for phase in phases {
+                // Install (or remove) the cost override for this phase.
+                match &phase.cost_fn {
+                    Some(f) => self.state.set_cost_override(Arc::clone(f)),
+                    None => self.state.clear_cost_override(),
+                }
+                self.current_cost = self.state.cost[usize::from(self.current_root)];
+                self.record_best = phase.record_best;
+
+                let mut stall = 0usize;
+                for _ in 0..phase.max_iter {
+                    if start.elapsed() >= max_time {
+                        break 'outer;
+                    }
+                    if let Some(mut hook) = self.iter_hook.take() {
+                        hook(self);
+                        self.iter_hook = Some(hook);
+                    }
+                    let result = self.step(phase.beta_schedule.as_ref(), rng);
+                    stall += !result.improved as usize;
+                    if stall >= phase.max_stall {
+                        break; // stalled — end this phase early
+                    }
+                }
+
+                // Need to rebuild the state because rebuild_costs require node to be in topological order,
+                // which is not maintained during the search.
+                self.state = State::new_with_analysis(
+                    self.state.rec_expr.extract(self.current_root),
+                    mem::take(&mut self.state.sto_analysis),
+                );
+                self.current_root = self.state.rec_expr.root();
+            }
+
+            // All phases exhausted for this run — restart or stop.
+            if restarts >= max_restart {
+                break;
+            }
+            restarts += 1;
+            let state = State::new_with_analysis(
+                self.initial_expr.clone(),
+                mem::take(&mut self.state.sto_analysis),
+            );
+            self.state = state;
+            self.current_root = self.state.rec_expr.root();
+            self.current_cost = self.state.cost[usize::from(self.current_root)];
+        }
+
+        // Restore defaults so the runner is in a clean state afterward.
+        self.state.clear_cost_override();
+        self.record_best = true;
+
         println!(
             "MH finished: best cost = {}, # proposed = {}, # accepted = {}",
             self.best_cost, self.n_proposed, self.n_accepted,

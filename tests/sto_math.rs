@@ -39,9 +39,9 @@ struct MathCost;
 
 impl StoAnalysis<Math> for MathCost {
     type Data = ();
-    fn make(_: &Math, _: &[()]) {}
+    fn make(&self, _: &Math, _: &[()]) {}
 
-    fn cost(enode: &Math, _: &[()], children_cost: &[f64]) -> f64 {
+    fn cost(&self, enode: &Math, _: &[()], children_cost: &[f64]) -> f64 {
         let op = match enode {
             Math::Diff(..) | Math::Integral(..) => 4.0,
             _ => 1.0,
@@ -60,7 +60,7 @@ fn const_at(state: &MathState, id: Id) -> Option<NotNan<f64>> {
     }
 }
 
-fn normalize_math(state: &mut MathState, node: Math) -> Option<Math> {
+fn normalize_math(state: &mut MathState, _id: Id, node: Math) -> Option<Math> {
     match node {
         Math::Add([a, b]) => {
             let folded = const_at(state, a)? + const_at(state, b)?;
@@ -257,7 +257,11 @@ fn metropolis_best(start: &str, n_steps: u64, beta: Option<f64>) -> (RecExpr<Mat
         beta_schedule: if let Some(b) = beta {
             Box::new(ConstantBeta(b))
         } else {
-            Box::new(PeriodicBeta)
+            Box::new(PeriodicBeta {
+                interval: 1000,
+                random_walk_steps: 3,
+                beta: 2.0,
+            })
         },
         ..StoConfig::default()
     };

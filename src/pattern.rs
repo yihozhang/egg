@@ -533,8 +533,8 @@ impl<L: Language, A: StoAnalysis<L>> StoApplier<L, A> for Pattern<L> {
     ///
     /// `pos` (the matched position) is unused: the substitution already
     /// captures everything needed to instantiate the RHS.
-    fn apply_one(&self, state: &mut State<L, A>, _pos: Id, subst: &Subst) -> Option<Id> {
-        Some(sto_apply_pat(&self.ast, state, subst))
+    fn apply_one(&self, state: &mut State<L, A>, _pos: Id, subst: &Subst) -> smallvec::SmallVec<[Id; 4]> {
+        smallvec::smallvec![sto_apply_pat(&self.ast, state, subst)]
     }
 
     fn vars(&self) -> Vec<Var> {
