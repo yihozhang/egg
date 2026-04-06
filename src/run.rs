@@ -456,6 +456,179 @@ where
         self
     }
 
+    /// Run this `Runner` until it stops while checking equivalence with goals at iteration level.
+    /// After this, the field
+    /// [`stop_reason`](Runner::stop_reason) is guaranteed to be
+    /// set.
+    pub fn run_check_iteration<'a, R>(mut self, rules: R, goals: &[Pattern<L>]) -> Self
+    where
+        R: IntoIterator<Item = &'a Rewrite<L, N>>,
+        L: 'a,
+        N: 'a,
+    {
+        let rules: Vec<&Rewrite<L, N>> = rules.into_iter().collect();
+        check_rules(&rules);
+        let start_id = self.egraph.find(*self.roots.last().unwrap());
+        let mut proved_goal = false;
+        let mut proved_goal_index = 0;
+        self.egraph.rebuild();
+        loop {
+            let iter = self.run_one(&rules);
+            self.iterations.push(iter);
+
+            for (goal_index, goal) in goals.iter().enumerate() {
+                if !(goal.search_eclass(&self.egraph, start_id)).is_none() {
+                    proved_goal = true;
+                    proved_goal_index = goal_index;
+                    break;
+                }
+            }
+
+            if let Some(stop_reason) = &self.iterations.last().unwrap().stop_reason {
+                info!("Stopping: {:?}", stop_reason);
+                self.stop_reason = Some(stop_reason.clone());
+                break;
+            } else {
+                if proved_goal {
+                    info!(
+                        "Stopping goal {} matched",
+                        goals[proved_goal_index].to_string()
+                    );
+                    self.stop_reason = Some(StopReason::Other(
+                        format!("Goal {} Matched", goals[proved_goal_index]).to_string(),
+                    ));
+                    break;
+                }
+            }
+        }
+
+        assert!(!self.iterations.is_empty());
+        assert!(self.stop_reason.is_some());
+        self
+    }
+
+    /// Run this `Runner` until it stops while checking equivalence with goals at iteration level.
+    /// After this, the field
+    /// [`stop_reason`](Runner::stop_reason) is guaranteed to be
+    /// set.
+    pub fn run_check_iteration_id<'a, R>(
+        mut self,
+        rules: R,
+        goals: &[Pattern<L>],
+        start_id: Id,
+    ) -> Self
+    where
+        R: IntoIterator<Item = &'a Rewrite<L, N>>,
+        L: 'a,
+        N: 'a,
+    {
+        let rules: Vec<&Rewrite<L, N>> = rules.into_iter().collect();
+        check_rules(&rules);
+        // let start_id = self.egraph.find(*self.roots.last().unwrap());
+        let mut proved_goal = false;
+        let mut proved_goal_index = 0;
+        self.egraph.rebuild();
+        loop {
+            let iter = self.run_one(&rules);
+            self.iterations.push(iter);
+
+            for (goal_index, goal) in goals.iter().enumerate() {
+                if !(goal.search_eclass(&self.egraph, start_id)).is_none() {
+                    proved_goal = true;
+                    proved_goal_index = goal_index;
+                    break;
+                }
+            }
+
+            if let Some(stop_reason) = &self.iterations.last().unwrap().stop_reason {
+                info!("Stopping: {:?}", stop_reason);
+                self.stop_reason = Some(stop_reason.clone());
+                break;
+            } else {
+                if proved_goal {
+                    info!("Stopping goal {:?} matched", goals[proved_goal_index]);
+                    self.stop_reason = Some(StopReason::Other(
+                        format!("Goal {:?} Matched", goals[proved_goal_index]).to_string(),
+                    ));
+                    break;
+                }
+            }
+        }
+
+        assert!(!self.iterations.is_empty());
+        assert!(self.stop_reason.is_some());
+        self
+    }
+
+    /// Run this `Runner` until it stops while checking equivalence with goals and impossbile patterns at iteration level to terminate fast.
+    /// After this, the field
+    /// [`stop_reason`](Runner::stop_reason) is guaranteed to be
+    /// set.
+    pub fn run_fast<'a, R>(
+        mut self,
+        rules: R,
+        goals: &[Pattern<L>],
+        check_impo: fn(&EGraph<L, N>, Id) -> (bool, String),
+    ) -> (Self, f64)
+    where
+        R: IntoIterator<Item = &'a Rewrite<L, N>>,
+        L: 'a,
+        N: 'a,
+    {
+        let rules: Vec<&Rewrite<L, N>> = rules.into_iter().collect();
+        check_rules(&rules);
+        let start_id = self.egraph.find(*self.roots.last().unwrap());
+        let mut proved_goal = false;
+        let mut proved_goal_index = 0;
+        let mut impo_time = 0.0;
+        self.egraph.rebuild();
+        loop {
+            let iter = self.run_one(&rules);
+            self.iterations.push(iter);
+
+            // Checking goals
+            for (goal_index, goal) in goals.iter().enumerate() {
+                if !(goal.search_eclass(&self.egraph, start_id)).is_none() {
+                    proved_goal = true;
+                    proved_goal_index = goal_index;
+                    break;
+                }
+            }
+
+            // Checking impossibles
+            let now = Instant::now();
+            let (proved_impo, impo_proved) = check_impo(&self.egraph, start_id);
+            impo_time += now.elapsed().as_secs_f64();
+
+            if let Some(stop_reason) = &self.iterations.last().unwrap().stop_reason {
+                info!("Stopping: {:?}", stop_reason);
+                self.stop_reason = Some(stop_reason.clone());
+                break;
+            } else {
+                // Break if goal matched
+                if proved_goal {
+                    info!("Stopping goal {:?} matched", goals[proved_goal_index]);
+                    self.stop_reason = Some(StopReason::Other(
+                        format!("Goal {:?} Matched", goals[proved_goal_index]).to_string(),
+                    ));
+                    break;
+                }
+                // Break if impossible matched
+                if proved_impo {
+                    info!("Stopping impossible {} matched", impo_proved);
+                    self.stop_reason = Some(StopReason::Other(
+                        format!("Impossible {} Matched", impo_proved).to_string(),
+                    ));
+                    break;
+                }
+            }
+        }
+
+        assert!(!self.iterations.is_empty());
+        assert!(self.stop_reason.is_some());
+        (self, impo_time)
+    }
+
     /// Enable explanations for this runner's egraph.
     /// This allows the runner to explain why two expressions are
     /// equivalent with the [`explain_equivalence`](Runner::explain_equivalence) function.
