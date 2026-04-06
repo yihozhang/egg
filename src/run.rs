@@ -490,12 +490,9 @@ where
                 break;
             } else {
                 if proved_goal {
-                    info!(
-                        "Stopping goal {} matched",
-                        goals[proved_goal_index].to_string()
-                    );
+                    info!("Stopping: goal {} matched", proved_goal_index);
                     self.stop_reason = Some(StopReason::Other(
-                        format!("Goal {} Matched", goals[proved_goal_index]).to_string(),
+                        format!("Goal {} Matched", proved_goal_index),
                     ));
                     break;
                 }

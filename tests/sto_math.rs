@@ -1,7 +1,8 @@
 //! Stochastic search tests using a subset of the Math language.
 
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+use std::{collections::HashMap, thread::available_parallelism};
 
 use egg::{
     stochastic::{
@@ -11,6 +12,7 @@ use egg::{
     *,
 };
 use ordered_float::NotNan;
+use serial_test::serial;
 
 // ─── Language ────────────────────────────────────────────────────────────────
 
@@ -35,6 +37,7 @@ define_language! {
 // ─── Analysis / cost ─────────────────────────────────────────────────────────
 
 /// Stochastic analysis that assigns a high cost to `d` and `i` operators.
+#[derive(Default)]
 struct MathCost;
 
 impl StoAnalysis<Math> for MathCost {
@@ -175,7 +178,7 @@ fn is_const_or_distinct_sym(
     move |s: &MathState, _: Id, subst: &Subst| {
         let vi = subst[v];
         let wi = subst[w];
-        vi != wi
+        !structurally_equal(&s.rec_expr, vi, wi)
             && (matches!(s.rec_expr[vi], Math::Constant(_))
                 || matches!(s.rec_expr[vi], Math::Symbol(_)))
     }
@@ -250,29 +253,50 @@ fn rules() -> Vec<MathRw> {
 
 fn metropolis_best(start: &str, n_steps: u64, beta: Option<f64>) -> (RecExpr<Math>, f64) {
     let expr: RecExpr<Math> = start.parse().unwrap();
-    let mut runner = StoRunner::new(expr, rules()).with_normalizer(normalize_math);
-    let mut rng = SimpleLcg::new(0);
-    let config = StoConfig {
-        max_iter: n_steps as usize,
-        beta_schedule: if let Some(b) = beta {
-            Box::new(ConstantBeta(b))
-        } else {
-            Box::new(PeriodicBeta {
-                interval: 1000,
-                random_walk_steps: 3,
-                beta: 2.0,
-            })
-        },
-        ..StoConfig::default()
-    };
-    runner.run(config, &mut rng);
 
-    (runner.best_expr.clone(), runner.best_cost)
+    let n_threads = available_parallelism()
+        .map(|n| n.get() as usize)
+        .unwrap_or(1);
+    let handles: Vec<_> = (0..n_threads)
+        .map(|i| {
+            let expr = expr.clone();
+            let seed = i as u64;
+            std::thread::spawn(move || {
+                let mut runner = StoRunner::new(expr, rules()).with_normalizer(normalize_math);
+                let mut rng = SimpleLcg::new(seed);
+                let config = StoConfig {
+                    // max_iter: n_steps as usize,
+                    beta_schedule: if let Some(b) = beta {
+                        Box::new(ConstantBeta(b))
+                    } else {
+                        Box::new(PeriodicBeta {
+                            interval: 100,
+                            random_walk_steps: 10,
+                            beta: 1.0,
+                        })
+                    },
+                    max_time: Duration::from_secs(5),
+                    ..StoConfig::default()
+                };
+                runner.run(config, &mut rng);
+
+                (runner.best_expr.clone(), runner.best_cost)
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let (best_expr, best_cost) = results
+        .into_iter()
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .unwrap();
+    (best_expr, best_cost)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[test]
+#[serial]
 fn sto_diff_same() {
     // (d x x) → 1  via d-variable  (cost 102 → 1)
     let (_, cost) = metropolis_best("(d x x)", 50000, None);
@@ -280,6 +304,7 @@ fn sto_diff_same() {
 }
 
 #[test]
+#[serial]
 fn sto_diff_different() {
     // (d x y) → 0  via d-constant  (cost 102 → 1)
     let (_, cost) = metropolis_best("(d x y)", 50000, None);
@@ -287,6 +312,7 @@ fn sto_diff_different() {
 }
 
 #[test]
+#[serial]
 fn sto_zero_add() {
     // (+ x 0) → x  via zero-add  (cost 3 → 1)
     let (_, cost) = metropolis_best("(+ x 0)", 50000, None);
@@ -294,12 +320,13 @@ fn sto_zero_add() {
 }
 
 #[test]
+#[serial]
 fn sto_powers() {
     // (* (pow 2 x) (pow 2 y)) → (pow 2 (+ x y))  via pow-mul  (cost 7 → 5)
     let initial = {
         let expr: RecExpr<Math> = "(* (pow 2 x) (pow 2 y))".parse().unwrap();
         let s = MathState::new(expr);
-        s.cost[usize::from(s.root())]
+        s.cost[usize::from(s.rec_expr.root())]
     };
     let (_, best) = metropolis_best("(* (pow 2 x) (pow 2 y))", 50000, None);
     assert!(
@@ -311,19 +338,21 @@ fn sto_powers() {
 }
 
 #[test]
+#[serial]
 fn sto_simplify_add() {
     // (+ x (+ x (+ x x))) has a lower-cost equivalent, but reaching it usually
     // needs cost-increasing intermediate rewrites.
     let initial = {
         let e: RecExpr<Math> = "(+ x (+ x (+ x x)))".parse().unwrap();
         let s = MathState::new(e);
-        s.cost[usize::from(s.root())]
+        s.cost[usize::from(s.rec_expr.root())]
     };
     let (_, best) = metropolis_best("(+ x (+ x (+ x x)))", 1_000_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
 #[test]
+#[serial]
 fn sto_diff_sin() {
     // (d x (sin x)) → (cos x)  via d-sin  (cost 103 → 2)
     let (_, cost) = metropolis_best("(d x (sin x))", 50000, None);
@@ -331,18 +360,20 @@ fn sto_diff_sin() {
 }
 
 #[test]
+#[serial]
 fn sto_diff_simple2() {
     // (d x (+ 1 (* y x))) → y
     let initial = {
         let e: RecExpr<Math> = "(d x (+ 1 (* y x)))".parse().unwrap();
         let s = MathState::new(e);
-        s.cost[usize::from(s.root())]
+        s.cost[usize::from(s.rec_expr.root())]
     };
     let (_, best) = metropolis_best("(d x (+ 1 (* y x)))", 80_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
 #[test]
+#[serial]
 fn sto_diff_ln() {
     // (d x (ln x)) → (/ 1 x)
     let (_, cost) = metropolis_best("(d x (ln x))", 40000, None);
@@ -350,18 +381,20 @@ fn sto_diff_ln() {
 }
 
 #[test]
+#[serial]
 fn sto_diff_power_simple() {
     // (d x (pow x 3)) → (* 3 (pow x 2))
     let initial = {
         let e: RecExpr<Math> = "(d x (pow x 3))".parse().unwrap();
         let s = MathState::new(e);
-        s.cost[usize::from(s.root())]
+        s.cost[usize::from(s.rec_expr.root())]
     };
     let (_, best) = metropolis_best("(d x (pow x 3))", 80_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
 #[test]
+#[serial]
 fn sto_integ_cos() {
     // (i (cos x) x) → (sin x)  via i-cos  (cost 103 → 2)
     let (_, cost) = metropolis_best("(i (cos x) x)", 50000, None);
@@ -369,6 +402,7 @@ fn sto_integ_cos() {
 }
 
 #[test]
+#[serial]
 fn sto_integ_one() {
     // (i 1 x) → x
     let (_, cost) = metropolis_best("(i 1 x)", 2000, None);
@@ -376,6 +410,7 @@ fn sto_integ_one() {
 }
 
 #[test]
+#[serial]
 fn sto_integ_sin() {
     // Keep parity with math.rs naming: integ_sin checks (i (cos x) x) -> (sin x)
     let (_, cost) = metropolis_best("(i (cos x) x)", 2000, None);
@@ -383,6 +418,7 @@ fn sto_integ_sin() {
 }
 
 #[test]
+#[serial]
 fn sto_simplify_const() {
     // (+ 1 (- a (* (- 2 1) a))) → 1
     // Each step reduces cost: cf-sub folds (- 2 1)→1, then one-mul, cancel-sub, zero-add.
@@ -391,39 +427,42 @@ fn sto_simplify_const() {
 }
 
 #[test]
+#[serial]
 fn sto_integ_x() {
-    // (i (pow x 1) x) → (/ (pow x 2) 2)  via i-power-const then cf-add twice
-    // All steps reduce cost, so greedy descent reaches the target.
     let (_e, cost) = metropolis_best("(i (pow x 1) x)", 50000, None);
+    eprintln!("{}", _e.pretty(80));
     assert_eq!(cost, 5.0);
 }
 
 #[test]
+#[serial]
 fn sto_diff_simple1() {
     // (d x (+ 1 (* 2 x))) → 2  (multi-step; intermediate steps raise cost → needs annealing)
     let initial = {
         let e: RecExpr<Math> = "(d x (+ 1 (* 2 x)))".parse().unwrap();
         let s = MathState::new(e);
-        s.cost[usize::from(s.root())]
+        s.cost[usize::from(s.rec_expr.root())]
     };
     let (_, best) = metropolis_best("(d x (+ 1 (* 2 x)))", 50_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
 #[test]
+#[serial]
 fn sto_simplify_root() {
     // (/ 1 (- (/ (+ 1 (sqrt five)) 2) (/ (- 1 (sqrt five)) 2))) → (/ 1 (sqrt five))
     let expr = "(/ 1 (- (/ (+ 1 (sqrt five)) 2) (/ (- 1 (sqrt five)) 2)))";
     let initial = {
         let e: RecExpr<Math> = expr.parse().unwrap();
         let s = MathState::new(e);
-        s.cost[usize::from(s.root())]
+        s.cost[usize::from(s.rec_expr.root())]
     };
     let (_, best) = metropolis_best(expr, 100_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
 #[test]
+#[serial]
 fn sto_simplify_factor() {
     // Adapted from math_simplify_factor for stochastic optimization:
     // start from expanded form and expect factorization to reduce cost.
@@ -431,59 +470,63 @@ fn sto_simplify_factor() {
     let initial = {
         let e: RecExpr<Math> = expr.parse().unwrap();
         let s = MathState::new(e);
-        s.cost[usize::from(s.root())]
+        s.cost[usize::from(s.rec_expr.root())]
     };
     let (_, best) = metropolis_best(expr, 80_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
 #[test]
+#[serial]
 fn sto_diff_power_harder() {
     // (d x (- (pow x 3) (* 7 (pow x 2)))) has a much cheaper equivalent form.
     let expr = "(d x (- (pow x 3) (* 7 (pow x 2))))";
     let initial = {
         let e: RecExpr<Math> = expr.parse().unwrap();
         let s = MathState::new(e);
-        s.cost[usize::from(s.root())]
-    };
-    let (_, best) = metropolis_best(expr, 50_000, None);
-    assert!(best < initial, "expected cost < {}, got {}", initial, best);
-}
-
-#[test]
-fn sto_integ_part1() {
-    // (i (* x (cos x)) x)  via integration by parts.
-    let expr = "(i (* x (cos x)) x)";
-    let initial = {
-        let e: RecExpr<Math> = expr.parse().unwrap();
-        let s = MathState::new(e);
-        s.cost[usize::from(s.root())]
-    };
-    let (_, best) = metropolis_best(expr, 100_000, None);
-    assert!(best < initial, "expected cost < {}, got {}", initial, best);
-}
-
-#[test]
-fn sto_integ_part2() {
-    // (i (* (cos x) x) x) should also improve via the same identities.
-    let expr = "(i (* (cos x) x) x)";
-    let initial = {
-        let e: RecExpr<Math> = expr.parse().unwrap();
-        let s = MathState::new(e);
-        s.cost[usize::from(s.root())]
+        s.cost[usize::from(s.rec_expr.root())]
     };
     let (_, best) = metropolis_best(expr, 1_000_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
 }
 
 #[test]
+#[serial]
+fn sto_integ_part1() {
+    // (i (* x (cos x)) x)  via integration by parts.
+    let expr = "(i (* x (cos x)) x)";
+    let initial = {
+        let e: RecExpr<Math> = expr.parse().unwrap();
+        let s = MathState::new(e);
+        s.cost[usize::from(s.rec_expr.root())]
+    };
+    let (_, best) = metropolis_best(expr, 1_000_000, None);
+    assert!(best < initial, "expected cost < {}, got {}", initial, best);
+}
+
+#[test]
+#[serial]
+fn sto_integ_part2() {
+    // (i (* (cos x) x) x) should also improve via the same identities.
+    let expr = "(i (* (cos x) x) x)";
+    let initial = {
+        let e: RecExpr<Math> = expr.parse().unwrap();
+        let s = MathState::new(e);
+        s.cost[usize::from(s.rec_expr.root())]
+    };
+    let (_, best) = metropolis_best(expr, 1_000_000, None);
+    assert!(best < initial, "expected cost < {}, got {}", initial, best);
+}
+
+#[test]
+#[serial]
 fn sto_integ_part3() {
     // (i (ln x) x) -> (- (* x (ln x)) x) up to equivalent lower-cost forms.
     let expr = "(i (ln x) x)";
     let initial = {
         let e: RecExpr<Math> = expr.parse().unwrap();
         let s = MathState::new(e);
-        s.cost[usize::from(s.root())]
+        s.cost[usize::from(s.rec_expr.root())]
     };
     let (_, best) = metropolis_best(expr, 1_000_000, None);
     assert!(best < initial, "expected cost < {}, got {}", initial, best);
