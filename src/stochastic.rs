@@ -758,6 +758,26 @@ pub struct StoPhase<L: Language, A: StoAnalysis<L>> {
 
 // ─── StoRunner ────────────────────────────────────────────────────────────────
 
+/// Control flow returned by the [`StoRunner`] iteration hook.
+///
+/// The hook is called after each [`StoRunner::step`] call in [`StoRunner::run`]
+/// and [`StoRunner::run_phased`], and its return value steers the runner:
+///
+/// - [`Continue`][IterHookAction::Continue] — keep going normally.
+/// - [`Restart`][IterHookAction::Restart]  — immediately trigger a restart
+///   (reset to the initial expression); respects `max_restart` in [`StoConfig`]
+///   and the `max_restart` argument of [`StoRunner::run_phased`].
+/// - [`Abort`][IterHookAction::Abort]      — stop the run unconditionally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IterHookAction {
+    /// Continue to the next iteration as normal.
+    Continue,
+    /// Trigger a restart from the initial expression now.
+    Restart,
+    /// Abort the run immediately.
+    Abort,
+}
+
 /// The result of a single Metropolis-Hastings step.
 #[derive(Debug, Clone)]
 pub struct MhStepResult {
@@ -807,8 +827,9 @@ pub struct StoRunner<L: Language, A: StoAnalysis<L>> {
     pub record_best: bool,
     rules: Vec<StoRewrite<L, A>>,
     normalizer: Arc<dyn StoNormalizer<L, A> + Send + Sync>,
-    /// Optional hook called at the start of each iteration in [`StoRunner::run`].
-    iter_hook: Option<Box<dyn FnMut(&mut Self)>>,
+    /// Optional hook called after each step in [`StoRunner::run`] and [`StoRunner::run_phased`].
+    /// Its return value controls whether to continue, restart, or abort.
+    iter_hook: Option<Box<dyn FnMut(&mut Self) -> IterHookAction>>,
 }
 
 impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
@@ -844,8 +865,10 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
         }
     }
 
-    /// Set a per-iteration hook called at the start of each iteration in [`StoRunner::run`].
-    pub fn with_iter_hook(mut self, hook: impl FnMut(&mut Self) + 'static) -> Self {
+    /// Set a per-iteration hook called after each step in [`StoRunner::run`] and
+    /// [`StoRunner::run_phased`].  The hook inspects the runner and returns an
+    /// [`IterHookAction`] to control whether to continue, restart, or abort.
+    pub fn with_iter_hook(mut self, hook: impl FnMut(&mut Self) -> IterHookAction + 'static) -> Self {
         self.iter_hook = Some(Box::new(hook));
         self
     }
@@ -998,19 +1021,40 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
     /// Stops when `max_iter` iterations have been run, `max_time` has elapsed,
     /// `max_restart` restarts have occurred, or when `max_stall` consecutive
     /// non-improving iterations are reached and no further restarts are allowed.
+    /// The iteration hook (if any) may also trigger a [`Restart`][IterHookAction::Restart]
+    /// or [`Abort`][IterHookAction::Abort].
     pub fn run(&mut self, config: StoConfig, rng: &mut impl StoRng) {
         let start = Instant::now();
         let mut stall = 0usize;
         let mut restarts = 0usize;
-        for _ in 0..config.max_iter {
+        'outer: for _ in 0..config.max_iter {
             if start.elapsed() >= config.max_time {
                 break;
             }
-            if let Some(mut hook) = self.iter_hook.take() {
-                hook(self);
-                self.iter_hook = Some(hook);
-            }
             let result = self.step(config.beta_schedule.as_ref(), rng);
+            if let Some(mut hook) = self.iter_hook.take() {
+                let action = hook(self);
+                self.iter_hook = Some(hook);
+                match action {
+                    IterHookAction::Continue => {}
+                    IterHookAction::Abort => break 'outer,
+                    IterHookAction::Restart => {
+                        if restarts >= config.max_restart {
+                            break 'outer;
+                        }
+                        let state = State::new_with_analysis(
+                            self.initial_expr.clone(),
+                            mem::take(&mut self.state.sto_analysis),
+                        );
+                        self.state = state;
+                        self.current_root = self.state.rec_expr.root();
+                        self.current_cost = self.state.cost[usize::from(self.current_root)];
+                        stall = 0;
+                        restarts += 1;
+                        continue 'outer;
+                    }
+                }
+            }
             stall += !result.improved as usize;
             if stall >= config.max_stall {
                 if restarts >= config.max_restart {
@@ -1062,7 +1106,7 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
         let mut restarts = 0usize;
 
         'outer: loop {
-            for phase in phases {
+            'phases: for phase in phases {
                 // Install (or remove) the cost override for this phase.
                 match &phase.cost_fn {
                     Some(f) => self.state.set_cost_override(Arc::clone(f)),
@@ -1076,11 +1120,16 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
                     if start.elapsed() >= max_time {
                         break 'outer;
                     }
-                    if let Some(mut hook) = self.iter_hook.take() {
-                        hook(self);
-                        self.iter_hook = Some(hook);
-                    }
                     let result = self.step(phase.beta_schedule.as_ref(), rng);
+                    if let Some(mut hook) = self.iter_hook.take() {
+                        let action = hook(self);
+                        self.iter_hook = Some(hook);
+                        match action {
+                            IterHookAction::Continue => {}
+                            IterHookAction::Abort => break 'outer,
+                            IterHookAction::Restart => break 'phases,
+                        }
+                    }
                     stall += !result.improved as usize;
                     if stall >= phase.max_stall {
                         break; // stalled — end this phase early
@@ -1096,7 +1145,7 @@ impl<L: Language + Display, A: StoAnalysis<L>> StoRunner<L, A> {
                 self.current_root = self.state.rec_expr.root();
             }
 
-            // All phases exhausted for this run — restart or stop.
+            // All phases exhausted (or hook triggered Restart) — restart or stop.
             if restarts >= max_restart {
                 break;
             }
